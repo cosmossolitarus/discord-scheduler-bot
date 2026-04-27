@@ -32,20 +32,32 @@ from bot.llm.availability import parse_availability
 
 logger = logging.getLogger("scheduler.changes")
 
-# LLM prompt to classify change requests
+# LLM prompt to classify change requests — {assignment_context} is filled at runtime
 CHANGE_CLASSIFY_PROMPT = """You are a scheduling bot assistant. A user has sent a message
-requesting a change to their schedule. Classify the request.
+requesting a change to their schedule.
 
-Possible types:
-1. "update" — user is changing their availability or submitting new resources
-2. "swap" — user wants to swap their slot with another specific player
-3. "unclear" — you can't determine what they want
+{assignment_context}
 
-Respond with ONLY a JSON object:
-{"type": "update"|"swap"|"unclear", "details": "brief description of what they want"}
+Classify the request into one of these types:
+1. "swap" — user wants to swap their slot with another specific player (they mention a name)
+2. "update" — user is changing their availability, requesting a time change, dropping a slot,
+   or any other schedule modification. This includes relative requests like "push my slot back
+   30 minutes" or "move me earlier on Day 1".
+3. "unclear" — you genuinely can't determine what they want
 
-For swaps, also include:
-{"type": "swap", "other_user_mention": "<@123456>", "day": 1|2|4, "details": "..."}
+For swaps, include the other player's name and which day:
+{{"type": "swap", "other_player_name": "PlayerName", "day": 1, "details": "brief description"}}
+
+For updates, rewrite their request as a complete availability statement using their current
+assignments as context. For example, if they're assigned Day 1 at 07:45 UTC and say "push back
+30 minutes", rewrite as "Day 1: 08:15 UTC only". If they say "drop Day 2", rewrite as
+"Day 2: not available". Keep any days they did NOT mention unchanged — do NOT drop them.
+{{"type": "update", "rewritten_availability": "Day 1: 08:15 UTC only. Day 4: after 16 UTC", "details": "brief description"}}
+
+For unclear:
+{{"type": "unclear", "details": "what was confusing"}}
+
+Respond with ONLY the JSON object. No explanation.
 """
 
 
@@ -56,12 +68,11 @@ class Changes(commands.Cog):
     async def handle_change_request(self, message: discord.Message, day1: datetime):
         """
         Entry point for post-lock @mentions.
-        Classifies the request and routes accordingly.
+        Looks up user's current assignments for context, classifies, and routes.
         """
         import anthropic
         client = anthropic.AsyncAnthropic()
 
-        # Strip bot mention from content
         text_content = message.content
         for mention in message.mentions:
             if mention.id == self.bot.user.id:
@@ -73,54 +84,91 @@ class Changes(commands.Cog):
             for a in message.attachments
         )
 
-        # If there's an image, treat it as a resource update
         if has_image:
             await self._handle_resource_update(message, day1)
             return
 
-        # If there are other user mentions, likely a swap
+        # Direct @mention of another user → straight to swap
         other_mentions = [m for m in message.mentions if m.id != self.bot.user.id]
         if other_mentions:
             await self._handle_swap_request(message, day1, other_mentions[0])
             return
 
-        # Otherwise, use LLM to classify
+        # Look up current assignments for LLM context
+        assignment_context = await self._build_assignment_context(message.author.id, day1)
+        prompt = CHANGE_CLASSIFY_PROMPT.format(assignment_context=assignment_context)
+
+        from bot.llm.utils import extract_json
         try:
             response = await client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=200,
-                system=CHANGE_CLASSIFY_PROMPT,
+                max_tokens=300,
+                system=prompt,
                 messages=[{"role": "user", "content": text_content}],
             )
-            result = json.loads(response.content[0].text.strip())
+            result = extract_json(response.content[0].text.strip())
         except Exception as e:
             logger.error(f"Failed to classify change request: {e}")
+            result = None
+
+        if result is None:
             await message.reply(
-                "I had trouble understanding your request. Could you rephrase? "
-                "For example:\n"
-                "• \"I can't make my Day 2 slot, available after 4pm instead\"\n"
-                "• \"Swap Day 1 with @player\""
+                "I had trouble understanding your request. Could you rephrase?\n"
+                "• \"Push my Day 1 spot back by 30 minutes\"\n"
+                "• \"Swap Day 1 with @player\"\n"
+                "• \"Drop my Day 2 slot\""
             )
             return
 
         req_type = result.get("type", "unclear")
 
-        if req_type == "update":
-            await self._handle_availability_update(message, day1, text_content)
-        elif req_type == "swap":
-            # Try to find the mentioned user
-            await message.reply(
-                "For swaps, please @mention the player you want to swap with. "
-                "Example: \"@scheduler swap Day 1 with @player\""
-            )
+        if req_type == "swap":
+            other_name = result.get("other_player_name", "")
+            other_member = None
+            if other_name and message.guild:
+                other_member = discord.utils.find(
+                    lambda m: m.display_name.lower() == other_name.lower()
+                    or m.name.lower() == other_name.lower(),
+                    message.guild.members,
+                )
+            if other_member:
+                await self._handle_swap_request(message, day1, other_member)
+            else:
+                await message.reply(
+                    f"I think you want to swap with **{other_name}**, but I couldn't "
+                    f"find them. Please @mention them directly.\n"
+                    f"Example: \"@scheduler swap Day {result.get('day', 1)} with @{other_name}\""
+                )
+        elif req_type == "update":
+            rewritten = result.get("rewritten_availability", text_content)
+            await self._handle_availability_update(message, day1, rewritten)
         else:
             await message.reply(
                 "I wasn't sure what you meant. You can:\n"
-                "• Update your availability: \"@scheduler I can't make Day 2, "
-                "available Day 2 after 18:00 instead\"\n"
-                "• Swap with someone: \"@scheduler swap Day 1 with @player\"\n"
+                "• \"Push my Day 1 spot back by 30 minutes\"\n"
+                "• \"Swap Day 2 with @player\"\n"
+                "• \"Drop my Day 4 slot\"\n"
                 "• Submit a new screenshot: just attach it when you @mention me"
             )
+
+    async def _build_assignment_context(self, discord_id: int, day1: datetime) -> str:
+        """Build a text description of the user's current assignments for the LLM."""
+        async with async_session() as session:
+            event = await self._get_event(session, day1)
+            if event is None:
+                return "The user has no current assignments."
+            assignments = await self._get_user_assignments(session, event.event_id, discord_id)
+
+        if not assignments:
+            return "The user has no current assignments."
+
+        lines = ["The user's current assignments are:"]
+        for a in sorted(assignments, key=lambda x: x.slot.start_time):
+            start = a.slot.start_time.strftime("%H:%M UTC")
+            end = a.slot.end_time.strftime("%H:%M UTC")
+            track = "Noble Advisor" if a.slot.track == "NA" else "Chief Minister"
+            lines.append(f"  Day {a.slot.day} ({track}): {start} - {end}")
+        return "\n".join(lines)
 
     async def _handle_resource_update(self, message: discord.Message, day1: datetime):
         """Process a new screenshot submission after lock."""
