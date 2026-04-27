@@ -65,6 +65,10 @@ Where:
 
 If you cannot confidently extract the values, respond with:
 {"error": "description of what went wrong"}
+
+CRITICAL: Output ONLY the JSON object. No explanation, no calculations, no markdown, no reasoning.
+Wrong: "General Speedup: 73h 5m = 3.05 days... {json}"
+Right: {"resource_generic": 3.05, "resource_x": 1.73, "resource_y": 2.66, "resource_z": 3.60}
 """
 
 
@@ -109,15 +113,16 @@ async def parse_screenshot(image_data: bytes, media_type: str = "image/png") -> 
         )
     except Exception as e:
         logger.error(f"Anthropic API call failed: {e}")
-        return {"error": f"API call failed: {e}"}
+        return {"error": "API call failed. Please try again later."}
 
     raw_text = response.content[0].text.strip()
 
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        logger.warning(f"LLM returned non-JSON: {raw_text}")
-        return {"error": f"Could not parse LLM response: {raw_text}"}
+    from bot.llm.utils import extract_json
+    parsed = extract_json(raw_text)
+
+    if parsed is None:
+        logger.warning(f"LLM returned unparseable response: {raw_text[:200]}")
+        return {"error": "Could not extract speedup values from screenshot. Please try again."}
 
     if "error" in parsed:
         return parsed

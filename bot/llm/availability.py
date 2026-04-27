@@ -58,6 +58,8 @@ If the input is nonsensical or you cannot parse it:
 
 Be generous in interpretation — if a user says "Day 1 after 2pm" and a slot
 starts at 1:45pm, include it since most of the slot is after 2pm.
+
+CRITICAL: Output ONLY the JSON object. No explanation, no reasoning, no step-by-step work.
 """
 
 
@@ -96,15 +98,16 @@ async def parse_availability(
         )
     except Exception as e:
         logger.error(f"Anthropic API call failed: {e}")
-        return {"error": f"API call failed: {e}"}
+        return {"error": "API call failed. Please try again later."}
 
     raw_text = response.content[0].text.strip()
 
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        logger.warning(f"LLM returned non-JSON: {raw_text}")
-        return {"error": f"Could not parse LLM response: {raw_text}"}
+    from bot.llm.utils import extract_json
+    parsed = extract_json(raw_text)
+
+    if parsed is None:
+        logger.warning(f"LLM returned unparseable response: {raw_text[:200]}")
+        return {"error": "Could not parse your availability. Please try rephrasing."}
 
     if "error" in parsed:
         return parsed
