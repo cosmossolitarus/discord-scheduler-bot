@@ -1,5 +1,12 @@
 """
-Submissions cog — handles user submissions via @mentions.
+Submissions cog.
+
+Handles:
+    - Opening submissions (pinging @player in #scheduling)
+    - Processing user @mentions with screenshots and/or availability text
+    - Echoing parsed data back for confirmation
+    - Storing submissions in the database
+    - Prompting for missing info (screenshot or availability)
 """
 
 import logging
@@ -27,19 +34,25 @@ class Submissions(commands.Cog):
         self.bot = bot
 
     async def open_submissions(self, day1: datetime):
-        """Open submissions for an event. Idempotent."""
+        """
+        Open submissions for an event. Called by the lifecycle loop.
+        Idempotent — checks if event already exists.
+        """
         async with async_session() as session:
+            # Check if event already exists
             result = await session.execute(
                 select(Event).where(Event.day1_date == day1)
             )
             event = result.scalar_one_or_none()
             if event is not None:
-                return
+                return  # Already created
 
+            # Create event
             event = Event(day1_date=day1, phase=EventPhase.COLLECTING)
             session.add(event)
             await session.flush()
 
+            # Generate slots
             slot_defs = generate_slot_times(day1)
             for sd in slot_defs:
                 slot = Slot(
@@ -53,6 +66,7 @@ class Submissions(commands.Cog):
                 )
                 session.add(slot)
 
+            # Audit log
             session.add(AuditLog(
                 event_id=event.event_id,
                 action="Submissions opened",
@@ -63,6 +77,7 @@ class Submissions(commands.Cog):
             await session.commit()
             logger.info(f"Event created for Day 1 = {day1.date()}")
 
+        # Ping @player in #scheduling
         for guild in self.bot.guilds:
             channel = discord.utils.get(guild.text_channels, name=SCHEDULING_CHANNEL)
             role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
@@ -84,10 +99,16 @@ class Submissions(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        """Process messages that @mention the bot."""
+        # Ignore messages from bots (including self)
         if message.author.bot:
             return
+
+        # Only process if bot is mentioned
         if self.bot.user not in message.mentions:
             return
+
+        # Only process in #scheduling channel
         if message.channel.name != SCHEDULING_CHANNEL:
             return
 
@@ -100,16 +121,21 @@ class Submissions(commands.Cog):
             )
             return
 
+        # Determine if this is a submission or a change request
         if phase in (Phase.LOCKED, Phase.ACTIVE):
+            # Post-lock: route to changes cog
             changes_cog = self.bot.get_cog("Changes")
             if changes_cog:
                 await changes_cog.handle_change_request(message, day1)
             return
 
+        # Phase is COLLECTING — process submission
         await self._process_submission(message, day1)
 
     async def _process_submission(self, message: discord.Message, day1: datetime):
+        """Process a submission during the collecting phase."""
         async with async_session() as session:
+            # Get or create the event
             result = await session.execute(
                 select(Event).where(Event.day1_date == day1)
             )
@@ -118,6 +144,7 @@ class Submissions(commands.Cog):
                 await message.reply("Something went wrong — no event found. Please contact an admin.")
                 return
 
+            # Get or create submission for this user
             result = await session.execute(
                 select(Submission).where(
                     Submission.event_id == event.event_id,
@@ -135,6 +162,7 @@ class Submissions(commands.Cog):
                 session.add(submission)
                 await session.flush()
 
+            # Check for screenshot attachment
             screenshot_result = None
             if message.attachments:
                 for attachment in message.attachments:
@@ -145,7 +173,9 @@ class Submissions(commands.Cog):
                         )
                         break
 
+            # Check for availability text (message content minus the @mention)
             text_content = message.content
+            # Remove the bot mention from the text
             for mention in message.mentions:
                 text_content = text_content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
             text_content = text_content.strip()
@@ -158,9 +188,11 @@ class Submissions(commands.Cog):
                     text_content, day1_str, slot_reference
                 )
 
+            # Handle results
             response_parts = []
             has_error = False
 
+            # Process screenshot
             if screenshot_result is not None:
                 if "error" in screenshot_result:
                     response_parts.append(
@@ -177,16 +209,17 @@ class Submissions(commands.Cog):
                     submission.has_screenshot = True
                     submission.screenshot_url = message.attachments[0].url
                     response_parts.append(
-                        f"✅ **Resources received:**\n"
-                        f"Resource X: {submission.resource_x:,.0f}\n"
-                        f"Resource Y: {submission.resource_y:,.0f}\n"
-                        f"Resource Z: {submission.resource_z:,.0f}\n"
-                        f"Generic: {submission.resource_generic:,.0f}\n"
-                        f"*(Priority — X: {submission.priority_x:,.0f}, "
-                        f"Y: {submission.priority_y:,.0f}, "
-                        f"Z: {submission.priority_z:,.0f})*"
+                        f"✅ **Speedups received:**\n"
+                        f"Construction (Day 1): {submission.resource_x:.1f} days\n"
+                        f"Research (Day 2): {submission.resource_y:.1f} days\n"
+                        f"Soldier Training (Day 4): {submission.resource_z:.1f} days\n"
+                        f"General: {submission.resource_generic:.1f} days\n"
+                        f"*(Priority — Day 1: {submission.priority_x:.1f}d, "
+                        f"Day 2: {submission.priority_y:.1f}d, "
+                        f"Day 4: {submission.priority_z:.1f}d)*"
                     )
 
+            # Process availability
             if availability_result is not None:
                 if "error" in availability_result:
                     response_parts.append(
@@ -206,6 +239,7 @@ class Submissions(commands.Cog):
                         f"({len(availability_result['available_slots'])} slots matched)"
                     )
 
+            # Nothing was submitted
             if not response_parts:
                 await message.reply(
                     "I didn't find a screenshot or availability info in your message. "
@@ -214,6 +248,7 @@ class Submissions(commands.Cog):
                 )
                 return
 
+            # Check what's still missing
             missing_parts = []
             if not submission.has_screenshot:
                 missing_parts.append("a **screenshot** of your resources")
@@ -233,6 +268,7 @@ class Submissions(commands.Cog):
 
             submission.updated_at = datetime.now(timezone.utc)
 
+            # Audit log
             session.add(AuditLog(
                 event_id=event.event_id,
                 action="Submission updated" if submission.submission_id else "Submission created",

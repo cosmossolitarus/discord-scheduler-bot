@@ -1,5 +1,8 @@
 """
 Screenshot parsing via Anthropic vision API.
+
+Sends the game's "Resources & Speedups" screenshot to Claude,
+extracts speedup durations, converts to days, and returns them.
 """
 
 import base64
@@ -14,31 +17,75 @@ logger = logging.getLogger("scheduler.llm.screenshot")
 
 client = anthropic.AsyncAnthropic()
 
-# TODO: Replace placeholder resource names with actual in-game names.
-# Describe where each resource appears on the screenshot for better accuracy.
-SYSTEM_PROMPT = """You are a resource extraction assistant for a mobile game.
-The user will send a screenshot showing their resource counts.
-Extract exactly four values:
-- Resource X (Chief Minister resource for Day 1)
-- Resource Y (Chief Minister resource for Day 2)
-- Resource Z (Noble Advisor / Chief Minister resource for Day 4)
-- Generic resource (can be converted to any specific resource)
+SYSTEM_PROMPT = """You are a speedup resource extractor for a mobile strategy game.
 
-Respond with ONLY a JSON object, no markdown, no explanation:
-{"resource_x": <number>, "resource_y": <number>, "resource_z": <number>, "resource_generic": <number>}
+The user will send a screenshot of the "Resources & Speedups" popup showing the Speedups tab.
+This screen appears in MANY languages (English, French, Spanish, German, Korean, Arabic, Chinese, etc.).
+The layout and icons are always the same regardless of language.
 
-If you cannot confidently extract all four values, respond with:
+THE ROWS (always in this order, top to bottom):
+1. General Speedup — icon: plain blue double arrows (>>). This is the GENERIC resource.
+2. Soldier Training Speedup — icon: blue double arrows with a small helmet emblem. This is for DAY 4.
+3. Construction Speedup — icon: blue double arrows with a small hammer emblem. This is for DAY 1.
+4. Research Speedup — icon: blue double arrows with a small book emblem. This is for DAY 2.
+5. Learning Speedups — icon: blue double arrows with a crown/star emblem. IGNORE this row.
+6. Soldier Healing Speedup — icon: blue/teal arrows with a green cross (+). IGNORE this row.
+
+NOTE: Row 5 (Learning) may not appear on older screenshots. Row 6 (Healing) may be partially
+cut off at the bottom. Both are irrelevant — just ignore them.
+
+ARABIC LAYOUT: In Arabic, the screen is mirrored — icons appear on the RIGHT, names on the RIGHT,
+and time values on the LEFT. The row order from top to bottom is the same.
+
+TIME FORMAT: Values can be displayed in three different units depending on a checkbox at the bottom:
+- Days mode: "36 day(s)17 hr(s)12 min(s)" or localized equivalents (e.g., "36 jour(s)17 h12 min")
+- Hours mode: "881 hr(s)12 min(s)"
+- Minutes mode: "52,872 min(s)"
+The checkbox selection varies per screenshot. You must parse whatever format is shown.
+
+If a row shows "No items" (or equivalent in any language), that value is 0.
+
+YOUR TASK:
+1. Identify the four relevant rows by their position (1st through 4th) and/or icons.
+2. Extract the time value from each row.
+3. Convert ALL values to DAYS as a decimal number rounded to 2 decimal places.
+   - If shown in minutes: divide by 1440
+   - If shown in hours and minutes: convert to total minutes first, then divide by 1440
+   - If shown in days, hours, minutes: convert to total minutes first, then divide by 1440
+4. Return the result.
+
+Respond with ONLY a JSON object. No markdown, no explanation, no extra text:
+{"resource_generic": <days>, "resource_x": <days>, "resource_y": <days>, "resource_z": <days>}
+
+Where:
+- resource_generic = General Speedup (row 1) in days
+- resource_x = Construction Speedup (row 3) in days  
+- resource_y = Research Speedup (row 4) in days
+- resource_z = Soldier Training Speedup (row 2) in days
+
+If you cannot confidently extract the values, respond with:
 {"error": "description of what went wrong"}
 """
 
 
 async def parse_screenshot(image_data: bytes, media_type: str = "image/png") -> dict:
+    """
+    Parse a game screenshot to extract speedup values in days.
+
+    Args:
+        image_data: Raw image bytes.
+        media_type: MIME type of the image.
+
+    Returns:
+        Dict with keys resource_x, resource_y, resource_z, resource_generic
+        (all in days as floats), or a dict with key "error" if parsing failed.
+    """
     b64_image = base64.b64encode(image_data).decode("utf-8")
 
     try:
         response = await client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=200,
+            max_tokens=300,
             system=SYSTEM_PROMPT,
             messages=[
                 {
@@ -54,7 +101,7 @@ async def parse_screenshot(image_data: bytes, media_type: str = "image/png") -> 
                         },
                         {
                             "type": "text",
-                            "text": "Extract the resource values from this screenshot.",
+                            "text": "Extract the speedup values from this screenshot.",
                         },
                     ],
                 }
@@ -80,7 +127,7 @@ async def parse_screenshot(image_data: bytes, media_type: str = "image/png") -> 
         if key not in parsed:
             return {"error": f"Missing key: {key}"}
         try:
-            parsed[key] = float(parsed[key])
+            parsed[key] = round(float(parsed[key]), 2)
         except (ValueError, TypeError):
             return {"error": f"Non-numeric value for {key}: {parsed[key]}"}
 

@@ -1,5 +1,11 @@
 """
-Changes cog — post-lock change handling.
+Changes cog.
+
+Handles post-lock change requests:
+    - User updates (new availability, new screenshot)
+    - Swap requests between two users
+    - Auto-bump detection (>2x resources)
+    - Admin approval workflow in #schedule_approve
 """
 
 import json
@@ -26,6 +32,7 @@ from bot.llm.availability import parse_availability
 
 logger = logging.getLogger("scheduler.changes")
 
+# LLM prompt to classify change requests
 CHANGE_CLASSIFY_PROMPT = """You are a scheduling bot assistant. A user has sent a message
 requesting a change to their schedule. Classify the request.
 
@@ -47,9 +54,14 @@ class Changes(commands.Cog):
         self.bot = bot
 
     async def handle_change_request(self, message: discord.Message, day1: datetime):
+        """
+        Entry point for post-lock @mentions.
+        Classifies the request and routes accordingly.
+        """
         import anthropic
         client = anthropic.AsyncAnthropic()
 
+        # Strip bot mention from content
         text_content = message.content
         for mention in message.mentions:
             if mention.id == self.bot.user.id:
@@ -61,15 +73,18 @@ class Changes(commands.Cog):
             for a in message.attachments
         )
 
+        # If there's an image, treat it as a resource update
         if has_image:
             await self._handle_resource_update(message, day1)
             return
 
+        # If there are other user mentions, likely a swap
         other_mentions = [m for m in message.mentions if m.id != self.bot.user.id]
         if other_mentions:
             await self._handle_swap_request(message, day1, other_mentions[0])
             return
 
+        # Otherwise, use LLM to classify
         try:
             response = await client.messages.create(
                 model=ANTHROPIC_MODEL,
@@ -81,7 +96,8 @@ class Changes(commands.Cog):
         except Exception as e:
             logger.error(f"Failed to classify change request: {e}")
             await message.reply(
-                "I had trouble understanding your request. Could you rephrase?\n"
+                "I had trouble understanding your request. Could you rephrase? "
+                "For example:\n"
                 "• \"I can't make my Day 2 slot, available after 4pm instead\"\n"
                 "• \"Swap Day 1 with @player\""
             )
@@ -92,6 +108,7 @@ class Changes(commands.Cog):
         if req_type == "update":
             await self._handle_availability_update(message, day1, text_content)
         elif req_type == "swap":
+            # Try to find the mentioned user
             await message.reply(
                 "For swaps, please @mention the player you want to swap with. "
                 "Example: \"@scheduler swap Day 1 with @player\""
@@ -99,12 +116,15 @@ class Changes(commands.Cog):
         else:
             await message.reply(
                 "I wasn't sure what you meant. You can:\n"
-                "• Update availability: \"@scheduler I can't make Day 2, available after 18:00 instead\"\n"
-                "• Swap: \"@scheduler swap Day 1 with @player\"\n"
-                "• New screenshot: just attach it when you @mention me"
+                "• Update your availability: \"@scheduler I can't make Day 2, "
+                "available Day 2 after 18:00 instead\"\n"
+                "• Swap with someone: \"@scheduler swap Day 1 with @player\"\n"
+                "• Submit a new screenshot: just attach it when you @mention me"
             )
 
     async def _handle_resource_update(self, message: discord.Message, day1: datetime):
+        """Process a new screenshot submission after lock."""
+        # Parse screenshot
         for attachment in message.attachments:
             if attachment.content_type and attachment.content_type.startswith("image/"):
                 image_data = await attachment.read()
@@ -122,6 +142,7 @@ class Changes(commands.Cog):
             if event is None:
                 return
 
+            # Get existing submission
             sub_result = await session.execute(
                 select(Submission).where(
                     Submission.event_id == event.event_id,
@@ -131,7 +152,10 @@ class Changes(commands.Cog):
             submission = sub_result.scalar_one_or_none()
 
             if submission is None:
-                await message.reply("You don't have a submission for this event.")
+                await message.reply(
+                    "You don't have a submission for this event. "
+                    "Since the schedule is locked, please contact an admin."
+                )
                 return
 
             old_priorities = {
@@ -140,6 +164,7 @@ class Changes(commands.Cog):
                 "z": submission.priority_z,
             }
 
+            # Update resources
             submission.resource_x = result["resource_x"]
             submission.resource_y = result["resource_y"]
             submission.resource_z = result["resource_z"]
@@ -147,8 +172,12 @@ class Changes(commands.Cog):
             submission.compute_priorities(GENERIC_SPLIT)
             submission.screenshot_url = message.attachments[0].url
 
-            bump_opportunities = await self._check_auto_bump(session, event, submission)
+            # Check for auto-bump opportunity on each day
+            bump_opportunities = await self._check_auto_bump(
+                session, event, submission
+            )
 
+            # Create change request
             change = ChangeRequest(
                 event_id=event.event_id,
                 requested_by=message.author.id,
@@ -174,18 +203,24 @@ class Changes(commands.Cog):
                 actor=str(message.author.id),
                 details=change.details,
             ))
+
             await session.commit()
 
+            # Notify user
             await message.reply(
                 f"✅ Resources updated. Your request is **pending admin review**.\n"
-                f"Priority — X: {submission.priority_x:,.0f}, "
-                f"Y: {submission.priority_y:,.0f}, "
-                f"Z: {submission.priority_z:,.0f}"
+                f"Priority — Day 1: {submission.priority_x:.1f}d, "
+                f"Day 2: {submission.priority_y:.1f}d, "
+                f"Day 4: {submission.priority_z:.1f}d"
             )
 
+            # Post to #schedule_approve
             await self._post_approval_request(message.guild, change, event, submission)
 
-    async def _handle_availability_update(self, message, day1, text):
+    async def _handle_availability_update(
+        self, message: discord.Message, day1: datetime, text: str
+    ):
+        """Process an availability change after lock."""
         slot_reference = generate_slot_times(day1)
         day1_str = day1.strftime("%B %d, %Y")
         avail_result = await parse_availability(text, day1_str, slot_reference)
@@ -206,6 +241,7 @@ class Changes(commands.Cog):
                 )
             )
             submission = sub_result.scalar_one_or_none()
+
             if submission is None:
                 await message.reply("You don't have a submission for this event.")
                 return
@@ -233,6 +269,7 @@ class Changes(commands.Cog):
                 actor=str(message.author.id),
                 details=change.details,
             ))
+
             await session.commit()
 
             interp = avail_result.get("interpretation", "")
@@ -240,14 +277,19 @@ class Changes(commands.Cog):
                 f"✅ Availability update received: {interp}\n"
                 f"Your request is **pending admin review**."
             )
+
             await self._post_approval_request(message.guild, change, event, submission)
 
-    async def _handle_swap_request(self, message, day1, other_user):
+    async def _handle_swap_request(
+        self, message: discord.Message, day1: datetime, other_user: discord.Member
+    ):
+        """Process a swap request between two users."""
         async with async_session() as session:
             event = await self._get_event(session, day1)
             if event is None:
                 return
 
+            # Get both users' assignments
             requester_assignments = await self._get_user_assignments(
                 session, event.event_id, message.author.id
             )
@@ -262,20 +304,26 @@ class Changes(commands.Cog):
                 await message.reply(f"{other_user.display_name} doesn't have any assigned slots.")
                 return
 
+            # Find overlapping days/tracks
             req_slots = {(a.slot.day, a.slot.track): a for a in requester_assignments}
             other_slots = {(a.slot.day, a.slot.track): a for a in other_assignments}
             common = set(req_slots.keys()) & set(other_slots.keys())
 
             if not common:
                 await message.reply(
-                    f"You and {other_user.display_name} don't share any day/track assignments to swap."
+                    f"You and {other_user.display_name} don't share any day/track "
+                    f"assignments to swap."
                 )
                 return
 
+            # For simplicity, if there's exactly one common day/track, use it.
+            # Otherwise, ask for clarification.
             if len(common) > 1:
                 days_str = ", ".join(f"Day {d} {t}" for d, t in sorted(common))
                 await message.reply(
-                    f"You share multiple days: {days_str}. Please specify which day."
+                    f"You and {other_user.display_name} share multiple days: {days_str}. "
+                    f"Please specify which day, e.g., "
+                    f"\"@scheduler swap Day 1 with @{other_user.display_name}\""
                 )
                 return
 
@@ -283,6 +331,7 @@ class Changes(commands.Cog):
             req_assignment = req_slots[day_track]
             other_assignment = other_slots[day_track]
 
+            # Calculate deadlines
             earlier_slot = min(
                 req_assignment.slot, other_assignment.slot,
                 key=lambda s: s.start_time
@@ -292,9 +341,13 @@ class Changes(commands.Cog):
 
             now = datetime.now(timezone.utc)
             if now >= user_deadline:
-                await message.reply("It's too late to request this swap.")
+                await message.reply(
+                    "It's too late to request this swap — the earlier block "
+                    "starts in less than 30 minutes."
+                )
                 return
 
+            # Create change request
             change = ChangeRequest(
                 event_id=event.event_id,
                 requested_by=message.author.id,
@@ -320,8 +373,10 @@ class Changes(commands.Cog):
                 actor=str(message.author.id),
                 details=change.details,
             ))
+
             await session.commit()
 
+            # Echo in channel
             req_time = req_assignment.slot.start_time.strftime("%H:%M UTC")
             other_time = other_assignment.slot.start_time.strftime("%H:%M UTC")
             await message.reply(
@@ -331,6 +386,7 @@ class Changes(commands.Cog):
                 f"Waiting for {other_user.display_name} to confirm."
             )
 
+            # DM the other user for confirmation
             try:
                 deadline_str = user_deadline.strftime("%b %d, %H:%M UTC")
                 dm_msg = await other_user.send(
@@ -343,6 +399,7 @@ class Changes(commands.Cog):
                 await dm_msg.add_reaction("✅")
                 await dm_msg.add_reaction("❌")
 
+                # Store message ID for reaction tracking
                 async with async_session() as session2:
                     change_obj = await session2.get(ChangeRequest, change.change_id)
                     change_obj.swap_confirm_message_id = dm_msg.id
@@ -356,39 +413,52 @@ class Changes(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Handle reactions on swap confirmations and admin approvals."""
         if payload.user_id == self.bot.user.id:
             return
+
         emoji = str(payload.emoji)
         if emoji not in ("✅", "❌"):
             return
 
         async with async_session() as session:
+            # Check if this is a swap confirmation
             result = await session.execute(
                 select(ChangeRequest).where(
                     ChangeRequest.swap_confirm_message_id == payload.message_id
                 )
             )
             change = result.scalar_one_or_none()
+
             if change and change.status == ChangeStatus.PENDING_CONFIRMATION:
                 await self._handle_swap_confirmation(session, change, emoji, payload)
                 return
 
+            # Check if this is an admin approval
             result = await session.execute(
                 select(ChangeRequest).where(
                     ChangeRequest.approval_message_id == payload.message_id
                 )
             )
             change = result.scalar_one_or_none()
+
             if change and change.status == ChangeStatus.PENDING_ADMIN:
+                # Verify the reactor has admin role
                 guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
                 if guild:
                     member = guild.get_member(payload.user_id)
                     admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
                     if member and admin_role and admin_role in member.roles:
-                        await self._handle_admin_decision(session, change, emoji, payload.user_id)
+                        await self._handle_admin_decision(
+                            session, change, emoji, payload.user_id
+                        )
 
-    async def _handle_swap_confirmation(self, session, change, emoji, payload):
+    async def _handle_swap_confirmation(
+        self, session, change: ChangeRequest, emoji: str, payload
+    ):
+        """Process swap confirmation from the second user."""
         now = datetime.now(timezone.utc)
+
         if change.user_deadline and now >= change.user_deadline:
             change.status = ChangeStatus.EXPIRED
             await session.commit()
@@ -398,26 +468,41 @@ class Changes(commands.Cog):
             change.status = ChangeStatus.REJECTED
             change.resolved_at = now
             await session.commit()
-            for guild in self.bot.guilds:
+
+            # Notify requester
+            guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+            if guild:
                 requester = guild.get_member(change.details["requester_id"])
+                other = guild.get_member(change.details["other_id"])
                 if requester:
                     try:
-                        await requester.send("Your swap request was declined.")
+                        await requester.send(
+                            f"Your swap request with {other.display_name if other else 'the other player'} "
+                            f"was declined."
+                        )
                     except discord.Forbidden:
                         pass
             return
 
+        # Accepted — move to admin approval
         change.status = ChangeStatus.PENDING_ADMIN
         await session.commit()
+
+        # Post to #schedule_approve
         for guild in self.bot.guilds:
             await self._post_swap_approval(guild, change)
 
-    async def _handle_admin_decision(self, session, change, emoji, admin_id):
+    async def _handle_admin_decision(
+        self, session, change: ChangeRequest, emoji: str, admin_id: int
+    ):
+        """Process admin approval or rejection."""
         now = datetime.now(timezone.utc)
+
         if change.admin_deadline and now >= change.admin_deadline:
             change.status = ChangeStatus.EXPIRED
             change.resolved_at = now
             await session.commit()
+            # TODO: notify affected users of expiration
             return
 
         change.resolved_at = now
@@ -429,6 +514,7 @@ class Changes(commands.Cog):
             await self._notify_change_result(change, approved=False)
             return
 
+        # Approved — apply the change
         change.status = ChangeStatus.APPROVED
 
         if change.change_type == ChangeType.SWAP:
@@ -444,41 +530,52 @@ class Changes(commands.Cog):
             actor=str(admin_id),
             details=change.details,
         ))
+
         await session.commit()
         await self._notify_change_result(change, approved=True)
 
+        # Regenerate CSV
         event = await session.get(Event, change.event_id)
         if event:
             scheduling_cog = self.bot.get_cog("Scheduling")
             if scheduling_cog:
                 csv_file = await scheduling_cog._generate_csv(event.day1_date)
                 for guild in self.bot.guilds:
-                    log_ch = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
+                    log_ch = discord.utils.get(
+                        guild.text_channels, name=SCHEDULE_LOG_CHANNEL
+                    )
                     if log_ch:
                         await log_ch.send(
                             f"Schedule updated (change #{change.change_id}).",
-                            file=discord.File(csv_file, filename=f"schedule_updated.csv"),
+                            file=discord.File(
+                                csv_file,
+                                filename=f"schedule_updated_{event.day1_date.date()}.csv",
+                            ),
                         )
 
-    async def _apply_swap(self, session, change):
+    async def _apply_swap(self, session, change: ChangeRequest):
+        """Swap two assignments."""
         details = change.details
-        r1 = await session.execute(
+        result1 = await session.execute(
             select(Assignment).where(
                 Assignment.event_id == change.event_id,
                 Assignment.slot_id == details["requester_slot"],
             )
         )
-        r2 = await session.execute(
+        result2 = await session.execute(
             select(Assignment).where(
                 Assignment.event_id == change.event_id,
                 Assignment.slot_id == details["other_slot"],
             )
         )
-        a1, a2 = r1.scalar_one_or_none(), r2.scalar_one_or_none()
+        a1 = result1.scalar_one_or_none()
+        a2 = result2.scalar_one_or_none()
+
         if a1 and a2:
             a1.discord_id, a2.discord_id = a2.discord_id, a1.discord_id
 
-    async def _apply_update(self, session, change):
+    async def _apply_update(self, session, change: ChangeRequest):
+        """Apply an availability or resource update."""
         details = change.details
         sub_result = await session.execute(
             select(Submission).where(
@@ -490,7 +587,8 @@ class Changes(commands.Cog):
         if submission and "new_availability" in details:
             submission.availability = details["new_availability"]
 
-    async def _apply_bump(self, session, change):
+    async def _apply_bump(self, session, change: ChangeRequest):
+        """Apply an auto-bump: replace one user with another in a slot."""
         details = change.details
         result = await session.execute(
             select(Assignment).where(
@@ -502,7 +600,10 @@ class Changes(commands.Cog):
         if assignment:
             assignment.discord_id = details["new_user"]
 
-    async def _check_auto_bump(self, session, event, submission):
+    async def _check_auto_bump(
+        self, session, event: Event, submission: Submission
+    ) -> list[dict]:
+        """Check if this submission qualifies for auto-bump on any day."""
         bumps = []
         day_resource_map = {1: "priority_x", 2: "priority_y", 4: "priority_z"}
 
@@ -511,6 +612,8 @@ class Changes(commands.Cog):
             if new_priority == 0:
                 continue
 
+            # Find the lowest-priority assigned user on this day
+            # that the new user could replace (within availability)
             result = await session.execute(
                 select(Assignment, Slot, Submission)
                 .join(Slot, Assignment.slot_id == Slot.slot_id)
@@ -541,10 +644,15 @@ class Changes(commands.Cog):
                         "bumped_priority": assigned_priority,
                         "new_priority": new_priority,
                     })
-                    break
+                    break  # One bump per day max
+
         return bumps
 
-    async def _post_approval_request(self, guild, change, event, submission):
+    async def _post_approval_request(
+        self, guild: discord.Guild, change: ChangeRequest,
+        event: Event, submission: Submission
+    ):
+        """Post a change request to #schedule_approve."""
         channel = discord.utils.get(guild.text_channels, name=SCHEDULE_APPROVE_CHANNEL)
         admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
         if not channel:
@@ -552,15 +660,16 @@ class Changes(commands.Cog):
 
         member = guild.get_member(change.requested_by)
         name = member.display_name if member else str(change.requested_by)
-        details = change.details
 
+        details = change.details
         desc = f"**Change Request #{change.change_id}**\n"
-        desc += f"Player: {name}\nType: {change.change_type.value}\n"
+        desc += f"Player: {name}\n"
+        desc += f"Type: {change.change_type.value}\n"
 
         if details.get("type") == "resource_update":
-            desc += f"Updated priorities: X={details['new_priorities']['x']:,.0f}, "
-            desc += f"Y={details['new_priorities']['y']:,.0f}, "
-            desc += f"Z={details['new_priorities']['z']:,.0f}\n"
+            desc += f"Priorities: Day 1={details['new_priorities']['x']:.1f}d, "
+            desc += f"Day 2={details['new_priorities']['y']:.1f}d, "
+            desc += f"Day 4={details['new_priorities']['z']:.1f}d\n"
             if details.get("bump_opportunities"):
                 for bump in details["bump_opportunities"]:
                     desc += (
@@ -571,18 +680,22 @@ class Changes(commands.Cog):
         elif details.get("type") == "availability_update":
             desc += f"Interpretation: {details.get('interpretation', 'N/A')}\n"
 
-        desc += "\nReact ✅ to approve or ❌ to reject."
+        desc += f"\nReact ✅ to approve or ❌ to reject."
 
-        msg = await channel.send(f"{admin_role.mention if admin_role else ''}\n{desc}")
+        msg = await channel.send(
+            f"{admin_role.mention if admin_role else ''}\n{desc}"
+        )
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
 
+        # Store the message ID
         async with async_session() as session2:
             change_obj = await session2.get(ChangeRequest, change.change_id)
             change_obj.approval_message_id = msg.id
             await session2.commit()
 
-    async def _post_swap_approval(self, guild, change):
+    async def _post_swap_approval(self, guild: discord.Guild, change: ChangeRequest):
+        """Post a confirmed swap to #schedule_approve for admin action."""
         channel = discord.utils.get(guild.text_channels, name=SCHEDULE_APPROVE_CHANNEL)
         admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
         if not channel:
@@ -591,8 +704,10 @@ class Changes(commands.Cog):
         details = change.details
         requester = guild.get_member(details["requester_id"])
         other = guild.get_member(details["other_id"])
+
         req_name = requester.display_name if requester else str(details["requester_id"])
         other_name = other.display_name if other else str(details["other_id"])
+
         deadline_str = change.admin_deadline.strftime("%b %d, %H:%M UTC") if change.admin_deadline else "N/A"
 
         desc = (
@@ -614,8 +729,10 @@ class Changes(commands.Cog):
             change_obj.approval_message_id = msg.id
             await session.commit()
 
-    async def _notify_change_result(self, change, approved):
+    async def _notify_change_result(self, change: ChangeRequest, approved: bool):
+        """DM affected users about the result of a change."""
         status_word = "approved" if approved else "declined"
+
         for guild in self.bot.guilds:
             if change.change_type == ChangeType.SWAP:
                 details = change.details
@@ -624,24 +741,43 @@ class Changes(commands.Cog):
                     if member:
                         try:
                             if approved:
-                                await member.send(f"Your swap on Day {details['day']} has been {status_word} and implemented.")
+                                await member.send(
+                                    f"Your swap on Day {details['day']} has been {status_word} "
+                                    f"and implemented."
+                                )
                             else:
-                                await member.send(f"The swap request on Day {details['day']} was {status_word}.")
+                                await member.send(
+                                    f"The swap request on Day {details['day']} was {status_word}."
+                                )
                         except discord.Forbidden:
                             pass
             else:
                 member = guild.get_member(change.requested_by)
                 if member:
                     try:
-                        await member.send(f"Your change request (#{change.change_id}) has been {status_word}.")
+                        await member.send(
+                            f"Your change request (#{change.change_id}) has been {status_word}."
+                        )
                     except discord.Forbidden:
                         pass
 
-    async def _get_event(self, session, day1):
-        result = await session.execute(select(Event).where(Event.day1_date == day1))
+    async def _get_event(self, session, day1: datetime) -> Event | None:
+        result = await session.execute(
+            select(Event).where(Event.day1_date == day1)
+        )
         return result.scalar_one_or_none()
 
-    async def _get_user_assignments(self, session, event_id, discord_id):
+    async def _get_user_assignments(self, session, event_id: int, discord_id: int):
+        result = await session.execute(
+            select(Assignment)
+            .join(Slot, Assignment.slot_id == Slot.slot_id)
+            .where(
+                Assignment.event_id == event_id,
+                Assignment.discord_id == discord_id,
+            )
+            .options()
+        )
+        # Need to eagerly load slot data
         result = await session.execute(
             select(Assignment, Slot)
             .join(Slot, Assignment.slot_id == Slot.slot_id)
@@ -651,6 +787,7 @@ class Changes(commands.Cog):
             )
         )
         rows = result.all()
+        # Attach slot to assignment for convenience
         assignments = []
         for assignment, slot in rows:
             assignment.slot = slot
