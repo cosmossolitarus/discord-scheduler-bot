@@ -72,18 +72,34 @@ Right: {"resource_generic": 3.05, "resource_x": 1.73, "resource_y": 2.66, "resou
 """
 
 
+def _detect_media_type(image_data: bytes) -> str:
+    """Detect actual image MIME type from file signature bytes."""
+    if image_data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if image_data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if image_data[:4] == b"RIFF" and image_data[8:12] == b"WEBP":
+        return "image/webp"
+    if image_data[:3] == b"GIF":
+        return "image/gif"
+    # Fallback
+    return "image/png"
+
+
 async def parse_screenshot(image_data: bytes, media_type: str = "image/png") -> dict:
     """
     Parse a game screenshot to extract speedup values in days.
 
     Args:
         image_data: Raw image bytes.
-        media_type: MIME type of the image.
+        media_type: MIME type of the image (used as fallback only).
 
     Returns:
         Dict with keys resource_x, resource_y, resource_z, resource_generic
         (all in days as floats), or a dict with key "error" if parsing failed.
     """
+    # Detect actual format from bytes — Discord's content_type can be wrong
+    media_type = _detect_media_type(image_data)
     b64_image = base64.b64encode(image_data).decode("utf-8")
 
     try:

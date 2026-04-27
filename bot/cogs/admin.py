@@ -149,14 +149,60 @@ class Admin(commands.Cog):
         else:
             await ctx.send("Scheduling cog not loaded.")
 
+    @commands.command(name="reset_event")
+    @commands.has_role(ADMIN_ROLE)
+    async def reset_event(self, ctx: commands.Context):
+        """Delete the current event and all its data so the cycle restarts fresh."""
+        async with async_session() as session:
+            # Find the most recent non-archived event (or most recent overall)
+            result = await session.execute(
+                select(Event).order_by(Event.day1_date.desc())
+            )
+            event = result.scalar_one_or_none()
+            if event is None:
+                await ctx.send("No event to reset.")
+                return
+
+            event_id = event.event_id
+            phase = event.phase
+            day1 = event.day1_date
+
+            # Cascade delete handles submissions, slots, assignments, changes, audit_log
+            await session.delete(event)
+            await session.commit()
+
+        # Clear reminders cache
+        reminders_cog = self.bot.get_cog("Reminders")
+        if reminders_cog:
+            reminders_cog.clear_sent_reminders()
+
+        await ctx.send(
+            f"Event reset (was {phase}, event_id={event_id}, day1={day1.date()}). "
+            f"Lifecycle loop will recreate it on next tick if we're in the collecting window."
+        )
+        logger.info(f"Admin {ctx.author} reset event {event_id} (day1={day1.date()})")
+
     @commands.command(name="force_archive")
     @commands.has_role(ADMIN_ROLE)
     async def force_archive(self, ctx: commands.Context):
-        day1 = get_current_cycle_day1()
+        # Query DB for latest non-archived event (get_current_cycle_day1 may
+        # have already jumped to the next cycle)
+        async with async_session() as session:
+            result = await session.execute(
+                select(Event)
+                .where(Event.phase != EventPhase.ARCHIVED)
+                .order_by(Event.day1_date.desc())
+            )
+            event = result.scalar_one_or_none()
+
+        if event is None:
+            await ctx.send("No active event to archive.")
+            return
+
         scheduling_cog = self.bot.get_cog("Scheduling")
         if scheduling_cog:
-            await scheduling_cog.archive(day1)
-            await ctx.send("Event archived.")
+            await scheduling_cog.archive(event.day1_date)
+            await ctx.send(f"Event archived (day1={event.day1_date.date()}).")
         else:
             await ctx.send("Scheduling cog not loaded.")
 

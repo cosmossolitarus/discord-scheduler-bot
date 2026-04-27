@@ -5,7 +5,7 @@ Main bot entry point.
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 try:
     from dotenv import load_dotenv
@@ -17,7 +17,7 @@ import discord
 from discord.ext import commands, tasks
 
 from bot.database import init_db, async_session
-from bot.config import SCHEDULING_CHANNEL, SCHEDULE_LOG_CHANNEL, SCHEDULE_APPROVE_CHANNEL
+from bot.config import SCHEDULING_CHANNEL, SCHEDULE_LOG_CHANNEL, SCHEDULE_APPROVE_CHANNEL, CYCLE_LENGTH_DAYS
 from bot.cycle import get_current_phase, get_current_cycle_day1, get_cycle_dates, Phase
 
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +74,20 @@ async def lifecycle_loop():
                 await scheduling_cog.archive(day1)
             if reminders_cog:
                 reminders_cog.clear_sent_reminders()
+
+        # When phase is IDLE, get_current_cycle_day1 has already jumped to the
+        # NEXT cycle, so the archive check above uses the wrong dates.
+        # Fix: also check the immediately preceding cycle.
+        if phase == Phase.IDLE:
+            prev_day1 = day1 - timedelta(days=CYCLE_LENGTH_DAYS)
+            prev_dates = get_cycle_dates(prev_day1)
+            if now >= prev_dates["archive"]:
+                scheduling_cog = bot.get_cog("Scheduling")
+                reminders_cog = bot.get_cog("Reminders")
+                if scheduling_cog:
+                    await scheduling_cog.archive(prev_day1)
+                if reminders_cog:
+                    reminders_cog.clear_sent_reminders()
 
     except Exception as e:
         logger.error(f"Lifecycle loop error: {e}", exc_info=True)
