@@ -1,5 +1,9 @@
 """
 Availability parsing via Anthropic text API.
+
+Takes free-text availability (e.g., "Day 1 anytime after 2pm,
+Day 2 10-14 and 18-22") and converts to a structured list of
+slot IDs the user is available for.
 """
 
 import json
@@ -16,6 +20,11 @@ client = anthropic.AsyncAnthropic()
 
 
 def build_system_prompt(day1_date_str: str, slot_reference: list[dict]) -> str:
+    """
+    Build a system prompt that includes the slot reference table
+    so the LLM knows exactly which slot IDs correspond to which times.
+    """
+    # Build a condensed reference: slot_id → "HH:MM - HH:MM UTC"
     slot_lines = []
     for s in slot_reference:
         start_str = s["start_time"].strftime("%Y-%m-%d %H:%M UTC")
@@ -35,6 +44,9 @@ The user will describe their availability in free text. They may use:
 - Time ranges ("10am to 6pm", "14:00-18:00", "after 3pm", "all day")
 - Timezone names ("3pm EST", "10am PST") — convert these to UTC
 - General phrases ("anytime", "morning", "evening", "not available")
+- "reset" or "daily reset" — this means exactly 0:00 UTC. So "just after reset" means
+  roughly 0:00-3:00 UTC, "before reset" means the hours before midnight UTC, and
+  "around reset" means a window on either side of 0:00 UTC.
 
 Your job: determine which slot IDs the user is available for.
 
@@ -54,14 +66,33 @@ async def parse_availability(
     day1_date_str: str,
     slot_reference: list[dict],
 ) -> dict:
+    """
+    Parse free-text availability into a list of slot IDs.
+
+    Args:
+        text: User's free-text availability description.
+        day1_date_str: Human-readable Day 1 date, e.g., "May 18, 2026".
+        slot_reference: Output of generate_slot_times() for this event.
+
+    Returns:
+        Dict with keys:
+            available_slots: list of slot_id strings
+            interpretation: human-readable summary
+        Or dict with key "error" if parsing failed.
+    """
     system = build_system_prompt(day1_date_str, slot_reference)
 
     try:
         response = await client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=4096,
+            max_tokens=4096,  # Slot list can be long
             system=system,
-            messages=[{"role": "user", "content": text}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": text,
+                }
+            ],
         )
     except Exception as e:
         logger.error(f"Anthropic API call failed: {e}")
@@ -81,6 +112,7 @@ async def parse_availability(
     if "available_slots" not in parsed:
         return {"error": "LLM response missing 'available_slots' key"}
 
+    # Validate slot IDs against the reference
     valid_ids = {s["slot_id"] for s in slot_reference}
     invalid = [sid for sid in parsed["available_slots"] if sid not in valid_ids]
     if invalid:
