@@ -49,5 +49,5 @@ SWAP_USER_DEADLINE_MINUTES = 30
 SWAP_ADMIN_DEADLINE_MINUTES = 0
 
 # ─── LLM ─────────────────────────────────────────────────────────
-ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
 LLM_RETRY_DELAY_SECONDS = 3600
