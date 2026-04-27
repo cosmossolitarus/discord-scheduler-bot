@@ -51,7 +51,11 @@ The user will describe their availability in free text. They may use:
 Your job: determine which slot IDs the user is available for.
 
 Respond with ONLY a JSON object, no markdown, no explanation:
-{{"available_slots": ["D1-CM-01", "D1-CM-02", ...], "interpretation": "brief human-readable summary of what you understood"}}
+{{"available_slots": ["D1-CM-01", "D1-CM-02", ...], "interpretation": "detailed log of what you understood", "player_summary": "brief 1-3 line summary for the player"}}
+
+The player_summary should be SHORT and use the player's own language/terms. One line per day.
+Example: "Day 1: Before 9am EST / around reset\nDay 2: Not available\nDay 4: After 16 UTC"
+Do NOT include slot IDs, slot counts, or UTC conversions in the player_summary.
 
 If the input is nonsensical or you cannot parse it:
 {{"error": "description of what went wrong"}}

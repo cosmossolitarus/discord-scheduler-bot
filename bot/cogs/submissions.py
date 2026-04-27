@@ -209,14 +209,11 @@ class Submissions(commands.Cog):
                     submission.has_screenshot = True
                     submission.screenshot_url = message.attachments[0].url
                     response_parts.append(
-                        f"✅ **Speedups received:**\n"
-                        f"Construction (Day 1): {submission.resource_x:.1f} days\n"
-                        f"Research (Day 2): {submission.resource_y:.1f} days\n"
-                        f"Soldier Training (Day 4): {submission.resource_z:.1f} days\n"
+                        f"✅ **Speedups:**\n"
                         f"General: {submission.resource_generic:.1f} days\n"
-                        f"*(Priority — Day 1: {submission.priority_x:.1f}d, "
-                        f"Day 2: {submission.priority_y:.1f}d, "
-                        f"Day 4: {submission.priority_z:.1f}d)*"
+                        f"Construction: {submission.resource_x:.1f} days\n"
+                        f"Research: {submission.resource_y:.1f} days\n"
+                        f"Troops: {submission.resource_z:.1f} days"
                     )
 
             # Process availability
@@ -232,11 +229,9 @@ class Submissions(commands.Cog):
                     submission.availability = availability_result["available_slots"]
                     submission.has_availability = True
                     submission.raw_availability_text = text_content
-                    interp = availability_result.get("interpretation", "")
+                    summary = availability_result.get("player_summary", "")
                     response_parts.append(
-                        f"✅ **Availability received:**\n"
-                        f"{interp}\n"
-                        f"({len(availability_result['available_slots'])} slots matched)"
+                        f"✅ **Availability:**\n{summary}"
                     )
 
             # Nothing was submitted
