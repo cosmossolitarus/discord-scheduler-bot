@@ -304,17 +304,6 @@ class Scheduling(commands.Cog):
 
         logger.info(f"Event archived for Day 1 = {day1.date()}")
 
-    @commands.command(name="view_schedule")
-    @commands.has_role(ADMIN_ROLE)
-    async def view_schedule(self, ctx: commands.Context):
-        """Admin command: view the current schedule as a CSV."""
-        day1 = get_current_cycle_day1()
-        csv_file = await self._generate_csv(day1)
-        await ctx.send(
-            "Current schedule:",
-            file=discord.File(csv_file, filename=f"schedule_{day1.date()}.csv"),
-        )
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Scheduling(bot))

@@ -1,11 +1,12 @@
 """
-Admin cog — admin-only commands.
+Admin cog — admin-only slash commands.
 """
 
 import logging
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select, func
 
@@ -20,13 +21,23 @@ from bot.cycle import get_current_phase, get_current_cycle_day1, get_cycle_dates
 logger = logging.getLogger("scheduler.admin")
 
 
+def is_admin():
+    """Check that the invoking user has the admin role."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        role = discord.utils.get(interaction.guild.roles, name=ADMIN_ROLE)
+        if role and role in interaction.user.roles:
+            return True
+        raise app_commands.MissingRole(ADMIN_ROLE)
+    return app_commands.check(predicate)
+
+
 class Admin(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="status")
-    @commands.has_role(ADMIN_ROLE)
-    async def status(self, ctx: commands.Context):
+    @app_commands.command(name="status", description="Show current cycle phase, dates, and submission stats")
+    @is_admin()
+    async def status(self, interaction: discord.Interaction):
         now = datetime.now(timezone.utc)
         phase, day1 = get_current_phase(now)
         dates = get_cycle_dates(day1)
@@ -94,11 +105,11 @@ class Admin(commands.Cog):
                     f"Pending changes: {pending_changes}",
                 ])
 
-        await ctx.send("\n".join(lines))
+        await interaction.response.send_message("\n".join(lines))
 
-    @commands.command(name="pending")
-    @commands.has_role(ADMIN_ROLE)
-    async def pending(self, ctx: commands.Context):
+    @app_commands.command(name="pending", description="List pending change requests")
+    @is_admin()
+    async def pending(self, interaction: discord.Interaction):
         day1 = get_current_cycle_day1()
 
         async with async_session() as session:
@@ -107,7 +118,7 @@ class Admin(commands.Cog):
             )
             event = result.scalar_one_or_none()
             if event is None:
-                await ctx.send("No active event.")
+                await interaction.response.send_message("No active event.")
                 return
 
             result = await session.execute(
@@ -122,12 +133,12 @@ class Admin(commands.Cog):
             changes = list(result.scalars().all())
 
         if not changes:
-            await ctx.send("No pending changes.")
+            await interaction.response.send_message("No pending changes.")
             return
 
         lines = [f"**{len(changes)} pending change(s):**\n"]
         for c in changes:
-            member = ctx.guild.get_member(c.requested_by)
+            member = interaction.guild.get_member(c.requested_by)
             name = member.display_name if member else str(c.requested_by)
             status_label = "awaiting player" if c.status == ChangeStatus.PENDING_CONFIRMATION else "awaiting admin"
             deadline = ""
@@ -135,58 +146,53 @@ class Admin(commands.Cog):
                 deadline = f" (deadline: {c.admin_deadline.strftime('%b %d %H:%M UTC')})"
             lines.append(f"#{c.change_id} — {c.change_type.value} by {name} [{status_label}]{deadline}")
 
-        await ctx.send("\n".join(lines))
+        await interaction.response.send_message("\n".join(lines))
 
-    @commands.command(name="force_lock")
-    @commands.has_role(ADMIN_ROLE)
-    async def force_lock(self, ctx: commands.Context):
+    @app_commands.command(name="force_lock", description="Lock submissions and run the optimizer now")
+    @is_admin()
+    async def force_lock(self, interaction: discord.Interaction):
         day1 = get_current_cycle_day1()
         scheduling_cog = self.bot.get_cog("Scheduling")
         if scheduling_cog:
-            await ctx.send("Locking submissions and running optimizer...")
+            await interaction.response.defer()
             await scheduling_cog.lock_and_release(day1)
-            await ctx.send("Done. Check #schedule_log.")
+            await interaction.followup.send("Done. Check #schedule_log.")
         else:
-            await ctx.send("Scheduling cog not loaded.")
+            await interaction.response.send_message("Scheduling cog not loaded.")
 
-    @commands.command(name="reset_event")
-    @commands.has_role(ADMIN_ROLE)
-    async def reset_event(self, ctx: commands.Context):
+    @app_commands.command(name="reset_event", description="Delete the current event and all its data")
+    @is_admin()
+    async def reset_event(self, interaction: discord.Interaction):
         """Delete the current event and all its data so the cycle restarts fresh."""
         async with async_session() as session:
-            # Find the most recent non-archived event (or most recent overall)
             result = await session.execute(
                 select(Event).order_by(Event.day1_date.desc())
             )
             event = result.scalar_one_or_none()
             if event is None:
-                await ctx.send("No event to reset.")
+                await interaction.response.send_message("No event to reset.")
                 return
 
             event_id = event.event_id
             phase = event.phase
             day1 = event.day1_date
 
-            # Cascade delete handles submissions, slots, assignments, changes, audit_log
             await session.delete(event)
             await session.commit()
 
-        # Clear reminders cache
         reminders_cog = self.bot.get_cog("Reminders")
         if reminders_cog:
             reminders_cog.clear_sent_reminders()
 
-        await ctx.send(
+        await interaction.response.send_message(
             f"Event reset (was {phase}, event_id={event_id}, day1={day1.date()}). "
             f"Lifecycle loop will recreate it on next tick if we're in the collecting window."
         )
-        logger.info(f"Admin {ctx.author} reset event {event_id} (day1={day1.date()})")
+        logger.info(f"Admin {interaction.user} reset event {event_id} (day1={day1.date()})")
 
-    @commands.command(name="force_archive")
-    @commands.has_role(ADMIN_ROLE)
-    async def force_archive(self, ctx: commands.Context):
-        # Query DB for latest non-archived event (get_current_cycle_day1 may
-        # have already jumped to the next cycle)
+    @app_commands.command(name="force_archive", description="Archive the current event immediately")
+    @is_admin()
+    async def force_archive(self, interaction: discord.Interaction):
         async with async_session() as session:
             result = await session.execute(
                 select(Event)
@@ -196,15 +202,30 @@ class Admin(commands.Cog):
             event = result.scalar_one_or_none()
 
         if event is None:
-            await ctx.send("No active event to archive.")
+            await interaction.response.send_message("No active event to archive.")
             return
 
         scheduling_cog = self.bot.get_cog("Scheduling")
         if scheduling_cog:
+            await interaction.response.defer()
             await scheduling_cog.archive(event.day1_date)
-            await ctx.send(f"Event archived (day1={event.day1_date.date()}).")
+            await interaction.followup.send(f"Event archived (day1={event.day1_date.date()}).")
         else:
-            await ctx.send("Scheduling cog not loaded.")
+            await interaction.response.send_message("Scheduling cog not loaded.")
+
+    @app_commands.command(name="view_schedule", description="Download the current schedule as a CSV")
+    @is_admin()
+    async def view_schedule(self, interaction: discord.Interaction):
+        day1 = get_current_cycle_day1()
+        scheduling_cog = self.bot.get_cog("Scheduling")
+        if scheduling_cog:
+            csv_file = await scheduling_cog._generate_csv(day1)
+            await interaction.response.send_message(
+                "Current schedule:",
+                file=discord.File(csv_file, filename=f"schedule_{day1.date()}.csv"),
+            )
+        else:
+            await interaction.response.send_message("Scheduling cog not loaded.")
 
 
 async def setup(bot: commands.Bot):

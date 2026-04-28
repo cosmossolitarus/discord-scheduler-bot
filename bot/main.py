@@ -40,6 +40,13 @@ async def on_ready():
     await init_db()
     logger.info("Database initialized")
 
+    # Sync slash commands with Discord
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        logger.error(f"Failed to sync slash commands: {e}")
+
     if not lifecycle_loop.is_running():
         lifecycle_loop.start()
     logger.info("Lifecycle loop started")
