@@ -17,7 +17,7 @@ import discord
 from discord.ext import commands, tasks
 
 from bot.database import init_db, async_session
-from bot.config import SCHEDULING_CHANNEL, SCHEDULE_LOG_CHANNEL, SCHEDULE_APPROVE_CHANNEL, CYCLE_LENGTH_DAYS
+from bot.config import SCHEDULING_CHANNEL, SCHEDULE_LOG_CHANNEL, SCHEDULE_APPROVE_CHANNEL, CYCLE_LENGTH_DAYS, GUILD_ID
 from bot.cycle import get_current_phase, get_current_cycle_day1, get_cycle_dates, Phase
 
 logging.basicConfig(level=logging.INFO)
@@ -42,8 +42,14 @@ async def on_ready():
 
     # Sync slash commands with Discord
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash command(s)")
+        # Guild-specific sync is instant; global sync can take up to an hour
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
+        global_synced = await bot.tree.sync()
+        logger.info(f"Synced {len(global_synced)} slash command(s) globally")
     except Exception as e:
         logger.error(f"Failed to sync slash commands: {e}")
 

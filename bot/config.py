@@ -3,8 +3,12 @@ Configuration for the scheduling bot.
 All configurable values in one place.
 """
 
+import os
 from datetime import datetime, timezone, timedelta
 
+
+# ─── Discord IDs ─────────────────────────────────────────────
+GUILD_ID = os.environ.get("DISCORD_GUILD_ID")  # Optional: enables instant slash command sync
 
 # ─── Discord Roles ───────────────────────────────────────────────
 ADMIN_ROLE = "admin"
