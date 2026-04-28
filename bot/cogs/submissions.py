@@ -114,15 +114,31 @@ class Submissions(commands.Cog):
 
         phase, day1 = get_current_phase()
 
-        if phase == Phase.IDLE:
+        # Also check the DB phase — if an admin used !force_lock, the DB
+        # phase may be ahead of the time-based phase.
+        db_phase = None
+        async with async_session() as session:
+            result = await session.execute(
+                select(Event).where(Event.day1_date == day1)
+            )
+            event = result.scalar_one_or_none()
+            if event is not None:
+                db_phase = event.phase
+
+        if phase == Phase.IDLE and db_phase is None:
             await message.reply(
                 "There's no active scheduling period right now. "
                 "I'll ping everyone when the next one opens."
             )
             return
 
-        # Determine if this is a submission or a change request
-        if phase in (Phase.LOCKED, Phase.ACTIVE):
+        # Route based on DB phase first (handles force_lock), then time phase
+        effective_locked = (
+            db_phase in (EventPhase.LOCKED, EventPhase.ACTIVE)
+            or phase in (Phase.LOCKED, Phase.ACTIVE)
+        )
+
+        if effective_locked:
             # Post-lock: route to changes cog
             changes_cog = self.bot.get_cog("Changes")
             if changes_cog:
@@ -182,6 +198,39 @@ class Submissions(commands.Cog):
 
             availability_result = None
             if text_content:
+                # Detect questions/queries — don't send them to parse_availability
+                question_words = ("what", "when", "where", "show", "check")
+                query_phrases = ("my times", "my schedule", "my info", "my speedup", "my current", "my data", "my status")
+                is_question = (
+                    "?" in text_content
+                    or text_content.lower().startswith(question_words)
+                    or any(p in text_content.lower() for p in query_phrases)
+                )
+                if is_question and screenshot_result is None:
+                    # Show current submission data instead of parsing
+                    info_lines = []
+                    if submission.has_screenshot:
+                        info_lines.append(
+                            f"**Speedups:** General {submission.resource_generic:.1f}d · "
+                            f"Construction {submission.resource_x:.1f}d · "
+                            f"Research {submission.resource_y:.1f}d · "
+                            f"Troops {submission.resource_z:.1f}d"
+                        )
+                    if submission.raw_availability_text:
+                        info_lines.append(f"**Availability on file:** {submission.raw_availability_text}")
+                    if not info_lines:
+                        info_lines.append("I don't have any data for you yet.")
+                    else:
+                        missing = []
+                        if not submission.has_screenshot:
+                            missing.append("screenshot")
+                        if not submission.has_availability:
+                            missing.append("availability")
+                        if missing:
+                            info_lines.append(f"Still needed: {', '.join(missing)}")
+                    await message.reply("\n".join(info_lines))
+                    return
+
                 slot_reference = generate_slot_times(day1)
                 day1_str = day1.strftime("%B %d, %Y")
                 availability_result = await parse_availability(
@@ -189,17 +238,17 @@ class Submissions(commands.Cog):
                 )
 
             # Handle results
-            response_parts = []
-            has_error = False
+            screenshot_ok = False
+            availability_ok = False
+            response_lines = []
 
             # Process screenshot
             if screenshot_result is not None:
                 if "error" in screenshot_result:
-                    response_parts.append(
-                        f"❌ **Screenshot:** {screenshot_result['error']}\n"
+                    response_lines.append(
+                        f"**Screenshot:** {screenshot_result['error']}\n"
                         f"Please try again with a clearer screenshot."
                     )
-                    has_error = True
                 else:
                     submission.resource_x = screenshot_result["resource_x"]
                     submission.resource_y = screenshot_result["resource_y"]
@@ -208,34 +257,49 @@ class Submissions(commands.Cog):
                     submission.compute_priorities(GENERIC_SPLIT)
                     submission.has_screenshot = True
                     submission.screenshot_url = message.attachments[0].url
-                    response_parts.append(
-                        f"✅ **Speedups:**\n"
-                        f"General: {submission.resource_generic:.1f} days\n"
-                        f"Construction: {submission.resource_x:.1f} days\n"
-                        f"Research: {submission.resource_y:.1f} days\n"
-                        f"Troops: {submission.resource_z:.1f} days"
+                    response_lines.append(
+                        f"**Speedups:** General {submission.resource_generic:.1f}d · "
+                        f"Construction {submission.resource_x:.1f}d · "
+                        f"Research {submission.resource_y:.1f}d · "
+                        f"Troops {submission.resource_z:.1f}d"
                     )
+                    screenshot_ok = True
 
             # Process availability
             if availability_result is not None:
                 if "error" in availability_result:
-                    response_parts.append(
-                        f"❌ **Availability:** {availability_result['error']}\n"
+                    response_lines.append(
+                        f"**Availability:** {availability_result['error']}\n"
                         f"Please try again — describe your available times for "
                         f"Day 1, Day 2, and/or Day 4."
                     )
-                    has_error = True
                 else:
-                    submission.availability = availability_result["available_slots"]
+                    new_slots = availability_result["available_slots"]
+
+                    # Merge logic: if user already has availability and the new
+                    # parse only covers some days, keep existing slots for
+                    # unmentioned days rather than wiping them
+                    existing_slots = submission.availability or []
+                    if existing_slots and new_slots:
+                        new_days = {sid.split("-")[0] for sid in new_slots}  # e.g. {"D2"}
+                        old_days = {sid.split("-")[0] for sid in existing_slots}
+                        unmentioned_days = old_days - new_days
+                        if unmentioned_days:
+                            kept = [
+                                sid for sid in existing_slots
+                                if sid.split("-")[0] in unmentioned_days
+                            ]
+                            new_slots = sorted(set(kept + new_slots))
+
+                    submission.availability = new_slots
                     submission.has_availability = True
                     submission.raw_availability_text = text_content
                     summary = availability_result.get("player_summary", "")
-                    response_parts.append(
-                        f"✅ **Availability:**\n{summary}"
-                    )
+                    response_lines.append(f"**Availability:**\n{summary}")
+                    availability_ok = True
 
             # Nothing was submitted
-            if not response_parts:
+            if not response_lines:
                 await message.reply(
                     "I didn't find a screenshot or availability info in your message. "
                     "Please send a screenshot of your resources and/or describe your "
@@ -243,23 +307,34 @@ class Submissions(commands.Cog):
                 )
                 return
 
-            # Check what's still missing
+            # Build final response with a single status indicator
+            has_any_error = (
+                (screenshot_result is not None and not screenshot_ok)
+                or (availability_result is not None and not availability_ok)
+            )
+
             missing_parts = []
             if not submission.has_screenshot:
                 missing_parts.append("a **screenshot** of your resources")
             if not submission.has_availability:
                 missing_parts.append("your **available times** for each day")
 
+            if has_any_error:
+                status = "❌"
+            elif missing_parts:
+                status = "⏳"
+            else:
+                status = "✅"
+
+            body = "\n".join(response_lines)
+
             if missing_parts:
-                response_parts.append(
-                    f"\n⏳ I still need {' and '.join(missing_parts)}. "
+                body += (
+                    f"\n\nI still need {' and '.join(missing_parts)}. "
                     f"Just @mention me again with the missing info."
                 )
-            elif not has_error:
-                response_parts.append(
-                    "\n✅ Your submission is complete! "
-                    "To update anything, just @mention me again."
-                )
+            elif not has_any_error:
+                body += "\n\nSubmission complete — to update anything, just @mention me again."
 
             submission.updated_at = datetime.now(timezone.utc)
 
@@ -277,7 +352,7 @@ class Submissions(commands.Cog):
 
             await session.commit()
 
-        await message.reply("\n\n".join(response_parts))
+        await message.reply(f"{status} {body}")
 
 
 async def setup(bot: commands.Bot):

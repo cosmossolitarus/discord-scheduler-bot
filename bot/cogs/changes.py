@@ -34,28 +34,35 @@ logger = logging.getLogger("scheduler.changes")
 
 # LLM prompt to classify change requests — {assignment_context} is filled at runtime
 CHANGE_CLASSIFY_PROMPT = """You are a scheduling bot assistant. A user has sent a message
-requesting a change to their schedule.
+in a channel where they @mention you for scheduling changes.
 
 {assignment_context}
 
 Classify the request into one of these types:
-1. "swap" — user wants to swap their slot with another specific player (they mention a name)
-2. "update" — user is changing their availability, requesting a time change, dropping a slot,
+1. "query" — user is asking about their current schedule, times, resources, or status.
+   They are NOT requesting a change. Examples: "what are my times?", "when am I scheduled?",
+   "show my info", "what are my speedups?"
+   {{"type": "query"}}
+
+2. "swap" — user wants to swap their slot with another specific player (they mention a name)
+   {{"type": "swap", "other_player_name": "PlayerName", "day": 1, "details": "brief description"}}
+
+3. "update" — user is changing their availability, requesting a time change, dropping a slot,
    or any other schedule modification. This includes relative requests like "push my slot back
    30 minutes" or "move me earlier on Day 1".
-3. "unclear" — you genuinely can't determine what they want
+   IMPORTANT: Identify which days are being modified. Only include days the user explicitly
+   mentions or clearly intends to change. If they say "set Day 2 to 3-5 UTC", days_modified
+   is [2] — do NOT include Day 1 or Day 4.
+   Rewrite ONLY the modified days as an availability statement. Do NOT rewrite days the user
+   didn't mention.
+   {{"type": "update", "days_modified": [2], "rewritten_availability": "Day 2: 3-5 UTC only", "details": "brief description"}}
 
-For swaps, include the other player's name and which day:
-{{"type": "swap", "other_player_name": "PlayerName", "day": 1, "details": "brief description"}}
+4. "nonsense" — the message is clearly a joke, trolling, irrelevant, or makes no sense as a
+   scheduling request. The user is not genuinely trying to interact with the scheduler.
+   {{"type": "nonsense", "details": "brief description of what they said"}}
 
-For updates, rewrite their request as a complete availability statement using their current
-assignments as context. For example, if they're assigned Day 1 at 07:45 UTC and say "push back
-30 minutes", rewrite as "Day 1: 08:15 UTC only". If they say "drop Day 2", rewrite as
-"Day 2: not available". Keep any days they did NOT mention unchanged — do NOT drop them.
-{{"type": "update", "rewritten_availability": "Day 1: 08:15 UTC only. Day 4: after 16 UTC", "details": "brief description"}}
-
-For unclear:
-{{"type": "unclear", "details": "what was confusing"}}
+5. "unclear" — you genuinely can't determine whether they want a query, update, or swap
+   {{"type": "unclear", "details": "what was confusing"}}
 
 Respond with ONLY the JSON object. No explanation.
 """
@@ -116,13 +123,16 @@ class Changes(commands.Cog):
                 "I had trouble understanding your request. Could you rephrase?\n"
                 "• \"Push my Day 1 spot back by 30 minutes\"\n"
                 "• \"Swap Day 1 with @player\"\n"
-                "• \"Drop my Day 2 slot\""
+                "• \"Drop my Day 2 slot\"\n"
+                "• \"What are my current times?\""
             )
             return
 
         req_type = result.get("type", "unclear")
 
-        if req_type == "swap":
+        if req_type == "query":
+            await self._handle_query(message, day1)
+        elif req_type == "swap":
             other_name = result.get("other_player_name", "")
             other_member = None
             if other_name and message.guild:
@@ -141,10 +151,14 @@ class Changes(commands.Cog):
                 )
         elif req_type == "update":
             rewritten = result.get("rewritten_availability", text_content)
-            await self._handle_availability_update(message, day1, rewritten)
+            days_modified = result.get("days_modified", None)
+            await self._handle_availability_update(message, day1, rewritten, days_modified)
+        elif req_type == "nonsense":
+            await self._handle_nonsense(message, result.get("details", ""))
         else:
             await message.reply(
                 "I wasn't sure what you meant. You can:\n"
+                "• \"What are my current times?\"\n"
                 "• \"Push my Day 1 spot back by 30 minutes\"\n"
                 "• \"Swap Day 2 with @player\"\n"
                 "• \"Drop my Day 4 slot\"\n"
@@ -152,23 +166,130 @@ class Changes(commands.Cog):
             )
 
     async def _build_assignment_context(self, discord_id: int, day1: datetime) -> str:
-        """Build a text description of the user's current assignments for the LLM."""
+        """Build a text description of the user's current data for the LLM."""
         async with async_session() as session:
             event = await self._get_event(session, day1)
             if event is None:
-                return "The user has no current assignments."
+                return "The user has no current data."
+
+            # Get submission (resources, availability)
+            sub_result = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event.event_id,
+                    Submission.discord_id == discord_id,
+                )
+            )
+            submission = sub_result.scalar_one_or_none()
+
+            # Get assignments
             assignments = await self._get_user_assignments(session, event.event_id, discord_id)
 
-        if not assignments:
-            return "The user has no current assignments."
+        lines = []
 
-        lines = ["The user's current assignments are:"]
-        for a in sorted(assignments, key=lambda x: x.slot.start_time):
-            start = a.slot.start_time.strftime("%H:%M UTC")
-            end = a.slot.end_time.strftime("%H:%M UTC")
-            track = "Noble Advisor" if a.slot.track == "NA" else "Chief Minister"
-            lines.append(f"  Day {a.slot.day} ({track}): {start} - {end}")
+        if submission:
+            if submission.has_screenshot:
+                lines.append(
+                    f"Speedups: Construction {submission.resource_x:.1f}d, "
+                    f"Research {submission.resource_y:.1f}d, "
+                    f"Troops {submission.resource_z:.1f}d, "
+                    f"General {submission.resource_generic:.1f}d"
+                )
+            if submission.raw_availability_text:
+                lines.append(f"Availability (what they originally said): \"{submission.raw_availability_text}\"")
+
+        if assignments:
+            lines.append("Current assigned slots:")
+            for a in sorted(assignments, key=lambda x: x.slot.start_time):
+                start = a.slot.start_time.strftime("%H:%M UTC")
+                end = a.slot.end_time.strftime("%H:%M UTC")
+                track = "Noble Advisor" if a.slot.track == "NA" else "Chief Minister"
+                lines.append(f"  Day {a.slot.day} ({track}): {start} - {end}")
+        else:
+            lines.append("The user has no current slot assignments.")
+
+        if not submission:
+            lines.append("The user has no submission for this event.")
+
         return "\n".join(lines)
+
+    async def _handle_query(self, message: discord.Message, day1: datetime):
+        """Respond to informational queries about the user's current data."""
+        async with async_session() as session:
+            event = await self._get_event(session, day1)
+            if event is None:
+                await message.reply("No active event found.")
+                return
+
+            sub_result = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event.event_id,
+                    Submission.discord_id == message.author.id,
+                )
+            )
+            submission = sub_result.scalar_one_or_none()
+            assignments = await self._get_user_assignments(
+                session, event.event_id, message.author.id
+            )
+
+        if not submission and not assignments:
+            await message.reply("I don't have any data for you in the current event.")
+            return
+
+        lines = []
+
+        if assignments:
+            lines.append("**Your assigned slots:**")
+            for a in sorted(assignments, key=lambda x: x.slot.start_time):
+                start = a.slot.start_time.strftime("%a %b %d, %H:%M")
+                end = a.slot.end_time.strftime("%H:%M UTC")
+                track = "Noble Advisor" if a.slot.track == "NA" else "Chief Minister"
+                lines.append(f"  Day {a.slot.day} ({track}): {start} - {end}")
+        elif submission:
+            lines.append("You have a submission but no slot assignments yet.")
+
+        if submission and submission.has_screenshot:
+            lines.append(
+                f"\n**Speedups:** Construction {submission.resource_x:.1f}d · "
+                f"Research {submission.resource_y:.1f}d · "
+                f"Troops {submission.resource_z:.1f}d · "
+                f"General {submission.resource_generic:.1f}d"
+            )
+
+        if submission and submission.raw_availability_text:
+            lines.append(f"\n**Availability on file:** {submission.raw_availability_text}")
+
+        await message.reply("\n".join(lines))
+
+    async def _handle_nonsense(self, message: discord.Message, details: str):
+        """Respond to nonsense/joke messages with personality."""
+        import anthropic
+        import random
+        client = anthropic.AsyncAnthropic()
+
+        try:
+            response = await client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=150,
+                system=(
+                    "You are a sassy scheduling bot. A user just sent you a nonsense message "
+                    "instead of an actual scheduling request. Respond with a short, witty "
+                    "one-liner that playfully roasts them while reminding them what you "
+                    "actually do. Keep it under 2 sentences. Be funny but not mean. "
+                    "Don't use emojis. Don't use quotation marks around your response."
+                ),
+                messages=[{"role": "user", "content": message.content}],
+            )
+            reply = response.content[0].text.strip()
+        except Exception:
+            replies = [
+                "I'm a scheduling bot, not a miracle worker. Try sending me your actual times.",
+                "That's fascinating. Now, did you have any actual scheduling to do?",
+                "My calendar says it's time for you to send a real request.",
+                "I'd roast you back but I'm too busy managing everyone else's schedule.",
+            ]
+            reply = random.choice(replies)
+
+        await message.reply(reply)
 
     async def _handle_resource_update(self, message: discord.Message, day1: datetime):
         """Process a new screenshot submission after lock."""
@@ -256,7 +377,7 @@ class Changes(commands.Cog):
 
             # Notify user
             await message.reply(
-                f"✅ Resources updated. Your request is **pending admin review**.\n"
+                f"⏳ Resource update received and **pending admin approval**.\n"
                 f"Priority — Day 1: {submission.priority_x:.1f}d, "
                 f"Day 2: {submission.priority_y:.1f}d, "
                 f"Day 4: {submission.priority_z:.1f}d"
@@ -266,9 +387,14 @@ class Changes(commands.Cog):
             await self._post_approval_request(message.guild, change, event, submission)
 
     async def _handle_availability_update(
-        self, message: discord.Message, day1: datetime, text: str
+        self, message: discord.Message, day1: datetime, text: str,
+        days_modified: list[int] | None = None,
     ):
-        """Process an availability change after lock."""
+        """Process an availability change after lock.
+
+        If days_modified is provided, only slots for those days are replaced;
+        existing slots for other days are preserved.
+        """
         slot_reference = generate_slot_times(day1)
         day1_str = day1.strftime("%B %d, %Y")
         avail_result = await parse_availability(text, day1_str, slot_reference)
@@ -276,6 +402,8 @@ class Changes(commands.Cog):
         if "error" in avail_result:
             await message.reply(f"❌ {avail_result['error']}. Please try again.")
             return
+
+        new_slots = avail_result["available_slots"]
 
         async with async_session() as session:
             event = await self._get_event(session, day1)
@@ -296,6 +424,27 @@ class Changes(commands.Cog):
 
             old_availability = submission.availability or []
 
+            # Merge: if days_modified is specified, keep existing slots for
+            # unmodified days and only replace slots for modified days
+            if days_modified and old_availability:
+                # Map day number to slot ID prefix (D1, D2, D4)
+                modified_prefixes = {f"D{d}-" for d in days_modified}
+
+                # Keep old slots for days NOT being modified
+                kept_slots = [
+                    sid for sid in old_availability
+                    if not any(sid.startswith(p) for p in modified_prefixes)
+                ]
+                # New slots are only for the modified days (filter just in case
+                # parse_availability returned slots for other days too)
+                new_day_slots = [
+                    sid for sid in new_slots
+                    if any(sid.startswith(p) for p in modified_prefixes)
+                ]
+                merged = sorted(set(kept_slots + new_day_slots))
+            else:
+                merged = new_slots
+
             change = ChangeRequest(
                 event_id=event.event_id,
                 requested_by=message.author.id,
@@ -304,7 +453,8 @@ class Changes(commands.Cog):
                 details={
                     "type": "availability_update",
                     "old_availability": old_availability,
-                    "new_availability": avail_result["available_slots"],
+                    "new_availability": merged,
+                    "days_modified": days_modified,
                     "interpretation": avail_result.get("interpretation", ""),
                 },
             )
@@ -321,9 +471,13 @@ class Changes(commands.Cog):
             await session.commit()
 
             interp = avail_result.get("interpretation", "")
+            days_str = (
+                f" (Day {', '.join(str(d) for d in days_modified)})"
+                if days_modified else ""
+            )
             await message.reply(
-                f"✅ Availability update received: {interp}\n"
-                f"Your request is **pending admin review**."
+                f"⏳ Availability update{days_str}: {interp}\n"
+                f"Your request is **pending admin approval**."
             )
 
             await self._post_approval_request(message.guild, change, event, submission)
