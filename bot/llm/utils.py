@@ -111,28 +111,30 @@ async def classify_message(text: str) -> str:
 # ─── Witty Nonsense Responses ────────────────────────────────────
 
 _FALLBACK_RESPONSES = [
-    "I'm a scheduling bot, not a miracle worker. Try sending me your actual times.",
-    "That's fascinating. Now, did you have any actual scheduling to do?",
-    "My calendar says it's time for you to send a real request.",
-    "I'd roast you back but I'm too busy managing everyone else's schedule.",
+    "Bro I literally only do one thing and it's not this.",
+    "Tell me your times or tell it to someone who cares.",
+    "Cool story. Now send your availability.",
+    "I'm going to pretend I didn't see that.",
+    "Sir this is a scheduling bot.",
+    "Rent free in your head and you're not even on the schedule yet.",
 ]
 
 
 async def generate_witty_response(message_text: str) -> str:
     """
-    Generate a short, sassy response to a nonsense message.
+    Generate a short, punchy roast in response to a nonsense message.
     Falls back to a canned response if the LLM call fails.
     """
     try:
         response = await client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=150,
+            max_tokens=60,
             system=(
-                "You are a sassy scheduling bot. A user just sent you a nonsense message "
-                "instead of an actual scheduling request. Respond with a short, witty "
-                "one-liner that playfully roasts them while reminding them what you "
-                "actually do. Keep it under 2 sentences. Be funny but not mean. "
-                "Don't use emojis. Don't use quotation marks around your response."
+                "You're a scheduling bot with the energy of a tired reddit commenter. "
+                "A user just @mentioned you with something completely irrelevant. "
+                "Roast them in ONE short sentence. Think twitter/instagram comment "
+                "energy — punchy, casual, a little mean but not cruel. No emojis. "
+                "No quotation marks. Don't explain what you do. Just clap back."
             ),
             messages=[{"role": "user", "content": message_text}],
         )
