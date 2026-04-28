@@ -36,6 +36,11 @@ logger = logging.getLogger("scheduler.changes")
 CHANGE_CLASSIFY_PROMPT = """You are a scheduling bot assistant. A user has sent a message
 in a channel where they @mention you for scheduling changes.
 
+Players often refer to days by their resource type:
+- "construction" / "building" = Day 1
+- "research" = Day 2
+- "troops" / "training" / "soldiers" = Day 4
+
 {assignment_context}
 
 Classify the request into one of these types:

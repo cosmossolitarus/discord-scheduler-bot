@@ -48,6 +48,13 @@ The user will describe their availability in free text. They may use:
   roughly 0:00-3:00 UTC, "before reset" means the hours before midnight UTC, and
   "around reset" means a window on either side of 0:00 UTC.
 
+IMPORTANT — Players often refer to days by their resource type instead of number:
+- "construction" / "building" = Day 1
+- "research" = Day 2
+- "troops" / "training" / "soldiers" = Day 4
+So "before noon for construction" means "Day 1: before noon", NOT "all days for construction".
+Each resource phrase maps to exactly one day.
+
 Your job: determine which slot IDs the user is available for.
 
 Respond with ONLY a JSON object, no markdown, no explanation:
