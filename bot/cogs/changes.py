@@ -267,33 +267,8 @@ class Changes(commands.Cog):
 
     async def _handle_nonsense(self, message: discord.Message, details: str):
         """Respond to nonsense/joke messages with personality."""
-        import anthropic
-        import random
-        client = anthropic.AsyncAnthropic()
-
-        try:
-            response = await client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=150,
-                system=(
-                    "You are a sassy scheduling bot. A user just sent you a nonsense message "
-                    "instead of an actual scheduling request. Respond with a short, witty "
-                    "one-liner that playfully roasts them while reminding them what you "
-                    "actually do. Keep it under 2 sentences. Be funny but not mean. "
-                    "Don't use emojis. Don't use quotation marks around your response."
-                ),
-                messages=[{"role": "user", "content": message.content}],
-            )
-            reply = response.content[0].text.strip()
-        except Exception:
-            replies = [
-                "I'm a scheduling bot, not a miracle worker. Try sending me your actual times.",
-                "That's fascinating. Now, did you have any actual scheduling to do?",
-                "My calendar says it's time for you to send a real request.",
-                "I'd roast you back but I'm too busy managing everyone else's schedule.",
-            ]
-            reply = random.choice(replies)
-
+        from bot.llm.utils import generate_witty_response
+        reply = await generate_witty_response(message.content)
         await message.reply(reply)
 
     async def _handle_resource_update(self, message: discord.Message, day1: datetime):

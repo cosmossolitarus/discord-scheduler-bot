@@ -25,6 +25,7 @@ from bot.cycle import (
 )
 from bot.llm.screenshot import parse_screenshot
 from bot.llm.availability import parse_availability
+from bot.llm.utils import classify_message, generate_witty_response
 
 logger = logging.getLogger("scheduler.submissions")
 
@@ -39,7 +40,6 @@ class Submissions(commands.Cog):
         Idempotent — checks if event already exists.
         """
         async with async_session() as session:
-            # Check if event already exists
             result = await session.execute(
                 select(Event).where(Event.day1_date == day1)
             )
@@ -47,12 +47,10 @@ class Submissions(commands.Cog):
             if event is not None:
                 return  # Already created
 
-            # Create event
             event = Event(day1_date=day1, phase=EventPhase.COLLECTING)
             session.add(event)
             await session.flush()
 
-            # Generate slots
             slot_defs = generate_slot_times(day1)
             for sd in slot_defs:
                 slot = Slot(
@@ -66,7 +64,6 @@ class Submissions(commands.Cog):
                 )
                 session.add(slot)
 
-            # Audit log
             session.add(AuditLog(
                 event_id=event.event_id,
                 action="Submissions opened",
@@ -77,7 +74,6 @@ class Submissions(commands.Cog):
             await session.commit()
             logger.info(f"Event created for Day 1 = {day1.date()}")
 
-        # Ping @player in #scheduling
         for guild in self.bot.guilds:
             channel = discord.utils.get(guild.text_channels, name=SCHEDULING_CHANNEL)
             role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
@@ -97,25 +93,21 @@ class Submissions(commands.Cog):
                     f"Submissions close automatically on **{lock_str}**."
                 )
 
+    # ─── Message Router ──────────────────────────────────────────
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Process messages that @mention the bot."""
-        # Ignore messages from bots (including self)
         if message.author.bot:
             return
-
-        # Only process if bot is mentioned
         if self.bot.user not in message.mentions:
             return
-
-        # Only process in #scheduling channel
         if message.channel.name != SCHEDULING_CHANNEL:
             return
 
         phase, day1 = get_current_phase()
 
-        # Also check the DB phase — if an admin used !force_lock, the DB
-        # phase may be ahead of the time-based phase.
+        # Check DB phase too — handles force_lock ahead of calendar
         db_phase = None
         async with async_session() as session:
             result = await session.execute(
@@ -132,26 +124,25 @@ class Submissions(commands.Cog):
             )
             return
 
-        # Route based on DB phase first (handles force_lock), then time phase
         effective_locked = (
             db_phase in (EventPhase.LOCKED, EventPhase.ACTIVE)
             or phase in (Phase.LOCKED, Phase.ACTIVE)
         )
 
         if effective_locked:
-            # Post-lock: route to changes cog
             changes_cog = self.bot.get_cog("Changes")
             if changes_cog:
                 await changes_cog.handle_change_request(message, day1)
             return
 
-        # Phase is COLLECTING — process submission
         await self._process_submission(message, day1)
+
+    # ─── Submission Processing ───────────────────────────────────
 
     async def _process_submission(self, message: discord.Message, day1: datetime):
         """Process a submission during the collecting phase."""
         async with async_session() as session:
-            # Get or create the event
+            # Get or create event
             result = await session.execute(
                 select(Event).where(Event.day1_date == day1)
             )
@@ -160,7 +151,7 @@ class Submissions(commands.Cog):
                 await message.reply("Something went wrong — no event found. Please contact an admin.")
                 return
 
-            # Get or create submission for this user
+            # Get or create submission
             result = await session.execute(
                 select(Submission).where(
                     Submission.event_id == event.event_id,
@@ -178,7 +169,8 @@ class Submissions(commands.Cog):
                 session.add(submission)
                 await session.flush()
 
-            # Check for screenshot attachment
+            # ── Process screenshot (if attached) ──
+
             screenshot_result = None
             if message.attachments:
                 for attachment in message.attachments:
@@ -189,60 +181,48 @@ class Submissions(commands.Cog):
                         )
                         break
 
-            # Check for availability text (message content minus the @mention)
+            # ── Extract and classify text ──
+
             text_content = message.content
-            # Remove the bot mention from the text
             for mention in message.mentions:
-                text_content = text_content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+                text_content = text_content.replace(
+                    f"<@{mention.id}>", ""
+                ).replace(
+                    f"<@!{mention.id}>", ""
+                )
             text_content = text_content.strip()
 
             availability_result = None
+            text_type = None
+
             if text_content:
-                # Detect questions/queries — don't send them to parse_availability
-                question_words = ("what", "when", "where", "show", "check")
-                query_phrases = ("my times", "my schedule", "my info", "my speedup", "my current", "my data", "my status")
-                is_question = (
-                    "?" in text_content
-                    or text_content.lower().startswith(question_words)
-                    or any(p in text_content.lower() for p in query_phrases)
-                )
-                if is_question and screenshot_result is None:
-                    # Show current submission data instead of parsing
-                    info_lines = []
-                    if submission.has_screenshot:
-                        info_lines.append(
-                            f"**Speedups:** General {submission.resource_generic:.1f}d · "
-                            f"Construction {submission.resource_x:.1f}d · "
-                            f"Research {submission.resource_y:.1f}d · "
-                            f"Troops {submission.resource_z:.1f}d"
-                        )
-                    if submission.raw_availability_text:
-                        info_lines.append(f"**Availability on file:** {submission.raw_availability_text}")
-                    if not info_lines:
-                        info_lines.append("I don't have any data for you yet.")
-                    else:
-                        missing = []
-                        if not submission.has_screenshot:
-                            missing.append("screenshot")
-                        if not submission.has_availability:
-                            missing.append("availability")
-                        if missing:
-                            info_lines.append(f"Still needed: {', '.join(missing)}")
-                    await message.reply("\n".join(info_lines))
+                text_type = await classify_message(text_content)
+
+                if text_type == "query" and screenshot_result is None:
+                    await self._handle_query(message, submission)
                     return
 
-                slot_reference = generate_slot_times(day1)
-                day1_str = day1.strftime("%B %d, %Y")
-                availability_result = await parse_availability(
-                    text_content, day1_str, slot_reference
-                )
+                if text_type == "nonsense" and screenshot_result is None:
+                    reply = await generate_witty_response(text_content)
+                    await message.reply(reply)
+                    return
 
-            # Handle results
+                # "availability" — or query/nonsense with a screenshot (process
+                # the screenshot, ignore the non-availability text)
+                if text_type == "availability":
+                    slot_reference = generate_slot_times(day1)
+                    day1_str = day1.strftime("%B %d, %Y")
+                    availability_result = await parse_availability(
+                        text_content, day1_str, slot_reference
+                    )
+
+            # ── Build response ──
+
+            response_lines = []
             screenshot_ok = False
             availability_ok = False
-            response_lines = []
 
-            # Process screenshot
+            # Screenshot results
             if screenshot_result is not None:
                 if "error" in screenshot_result:
                     response_lines.append(
@@ -265,7 +245,7 @@ class Submissions(commands.Cog):
                     )
                     screenshot_ok = True
 
-            # Process availability
+            # Availability results
             if availability_result is not None:
                 if "error" in availability_result:
                     response_lines.append(
@@ -276,12 +256,10 @@ class Submissions(commands.Cog):
                 else:
                     new_slots = availability_result["available_slots"]
 
-                    # Merge logic: if user already has availability and the new
-                    # parse only covers some days, keep existing slots for
-                    # unmentioned days rather than wiping them
+                    # Merge: keep existing slots for days not mentioned
                     existing_slots = submission.availability or []
                     if existing_slots and new_slots:
-                        new_days = {sid.split("-")[0] for sid in new_slots}  # e.g. {"D2"}
+                        new_days = {sid.split("-")[0] for sid in new_slots}
                         old_days = {sid.split("-")[0] for sid in existing_slots}
                         unmentioned_days = old_days - new_days
                         if unmentioned_days:
@@ -298,7 +276,7 @@ class Submissions(commands.Cog):
                     response_lines.append(f"**Availability:**\n{summary}")
                     availability_ok = True
 
-            # Nothing was submitted
+            # Nothing processed
             if not response_lines:
                 await message.reply(
                     "I didn't find a screenshot or availability info in your message. "
@@ -307,41 +285,41 @@ class Submissions(commands.Cog):
                 )
                 return
 
-            # Build final response with a single status indicator
-            has_any_error = (
+            # ── Status indicator + missing info ──
+
+            has_error = (
                 (screenshot_result is not None and not screenshot_ok)
                 or (availability_result is not None and not availability_ok)
             )
 
-            missing_parts = []
+            missing = []
             if not submission.has_screenshot:
-                missing_parts.append("a **screenshot** of your resources")
+                missing.append("a **screenshot** of your resources")
             if not submission.has_availability:
-                missing_parts.append("your **available times** for each day")
+                missing.append("your **available times** for each day")
 
-            if has_any_error:
+            if has_error:
                 status = "❌"
-            elif missing_parts:
+            elif missing:
                 status = "⏳"
             else:
                 status = "✅"
 
             body = "\n".join(response_lines)
 
-            if missing_parts:
+            if missing:
                 body += (
-                    f"\n\nI still need {' and '.join(missing_parts)}. "
+                    f"\n\nI still need {' and '.join(missing)}. "
                     f"Just @mention me again with the missing info."
                 )
-            elif not has_any_error:
+            elif not has_error:
                 body += "\n\nSubmission complete — to update anything, just @mention me again."
 
             submission.updated_at = datetime.now(timezone.utc)
 
-            # Audit log
             session.add(AuditLog(
                 event_id=event.event_id,
-                action="Submission updated" if submission.submission_id else "Submission created",
+                action="Submission updated",
                 actor=str(message.author.id),
                 details={
                     "has_screenshot": submission.has_screenshot,
@@ -353,6 +331,36 @@ class Submissions(commands.Cog):
             await session.commit()
 
         await message.reply(f"{status} {body}")
+
+    # ─── Query Handler ───────────────────────────────────────────
+
+    async def _handle_query(self, message: discord.Message, submission: Submission):
+        """Show the user their current submission data."""
+        lines = []
+
+        if submission.has_screenshot:
+            lines.append(
+                f"**Speedups:** General {submission.resource_generic:.1f}d · "
+                f"Construction {submission.resource_x:.1f}d · "
+                f"Research {submission.resource_y:.1f}d · "
+                f"Troops {submission.resource_z:.1f}d"
+            )
+
+        if submission.raw_availability_text:
+            lines.append(f"**Availability on file:** {submission.raw_availability_text}")
+
+        if not lines:
+            lines.append("I don't have any data for you yet.")
+
+        missing = []
+        if not submission.has_screenshot:
+            missing.append("screenshot")
+        if not submission.has_availability:
+            missing.append("availability")
+        if missing:
+            lines.append(f"Still needed: {', '.join(missing)}")
+
+        await message.reply("\n".join(lines))
 
 
 async def setup(bot: commands.Bot):
