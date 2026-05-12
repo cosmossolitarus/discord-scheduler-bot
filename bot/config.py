@@ -23,7 +23,7 @@ SCHEDULE_APPROVE_CHANNEL = "schedule_approve"  # Admin action queue
 # Anchor: Day 1 of a known event cycle, at 0:00 UTC.
 # Every subsequent cycle is exactly 28 days later.
 # ANCHOR_DAY1 = datetime(2026, 4, 20, 0, 0, 0, tzinfo=timezone.utc)
-ANCHOR_DAY1 = datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc)
+ANCHOR_DAY1 = datetime(2026, 5, 14, 0, 0, 0, tzinfo=timezone.utc)
 CYCLE_LENGTH_DAYS = 28
 
 # Submissions open 4 days before Day 0 (which is 1 day before Day 1).
