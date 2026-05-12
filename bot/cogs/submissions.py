@@ -25,7 +25,7 @@ from bot.cycle import (
 )
 from bot.llm.screenshot import parse_screenshot
 from bot.llm.availability import parse_availability
-from bot.llm.utils import classify_message, generate_witty_response
+from bot.llm.utils import classify_message, off_day_reply, BASIC_PROMPT_REPLY
 
 logger = logging.getLogger("scheduler.submissions")
 
@@ -196,19 +196,22 @@ class Submissions(commands.Cog):
             text_type = None
 
             if text_content:
-                text_type = await classify_message(text_content)
+                triage = await classify_message(text_content)
+                text_type = triage.get("type")
 
                 if text_type == "query" and screenshot_result is None:
                     await self._handle_query(message, submission)
                     return
 
-                if text_type == "nonsense" and screenshot_result is None:
-                    reply = await generate_witty_response(text_content)
-                    await message.reply(reply)
+                if text_type == "off_day" and screenshot_result is None:
+                    await message.reply(off_day_reply(triage.get("days", [])))
                     return
 
-                # "availability" — or query/nonsense with a screenshot (process
-                # the screenshot, ignore the non-availability text)
+                if text_type == "other" and screenshot_result is None:
+                    await message.reply(BASIC_PROMPT_REPLY)
+                    return
+
+                # "availability" — or any type when a screenshot is also attached
                 if text_type == "availability":
                     slot_reference = generate_slot_times(day1)
                     day1_str = day1.strftime("%B %d, %Y")

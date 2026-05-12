@@ -40,7 +40,7 @@ Here are all available slots:
 {slot_table}
 
 The user will describe their availability in free text. They may use:
-- Day numbers (Day 1, Day 2, Day 4)
+- Day numbers (Day 1, Day 2, Day 4 only — Day 3 and Day 5 are NOT tracked)
 - Time ranges ("10am to 6pm", "14:00-18:00", "after 3pm", "all day")
 - Timezone names ("3pm EST", "10am PST") — convert these to UTC
 - General phrases ("anytime", "morning", "evening", "not available")
@@ -54,6 +54,9 @@ IMPORTANT — Players often refer to days by their resource type instead of numb
 - "troops" / "training" / "soldiers" = Day 4
 So "before noon for construction" means "Day 1: before noon", NOT "all days for construction".
 Each resource phrase maps to exactly one day.
+
+If the user provides times for Day 3 or Day 5, IGNORE those days — only use times for
+Day 1, Day 2, and Day 4 when building the slot list.
 
 Your job: determine which slot IDs the user is available for.
 

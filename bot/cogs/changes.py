@@ -36,38 +36,38 @@ logger = logging.getLogger("scheduler.changes")
 CHANGE_CLASSIFY_PROMPT = """You are a scheduling bot assistant. A user has sent a message
 in a channel where they @mention you for scheduling changes.
 
-Players often refer to days by their resource type:
+Tracked days: Day 1, Day 2, Day 4 only. Players refer to days by resource type:
 - "construction" / "building" = Day 1
 - "research" = Day 2
 - "troops" / "training" / "soldiers" = Day 4
 
+Untracked days: Day 3 and Day 5. The bot does not handle these.
+
 {assignment_context}
 
-Classify the request into one of these types:
+Classify the request:
 1. "query" — user is asking about their current schedule, times, resources, or status.
-   They are NOT requesting a change. Examples: "what are my times?", "when am I scheduled?",
-   "show my info", "what are my speedups?"
+   They are NOT requesting a change.
    {{"type": "query"}}
 
 2. "swap" — user wants to swap their slot with another specific player (they mention a name)
    {{"type": "swap", "other_player_name": "PlayerName", "day": 1, "details": "brief description"}}
 
 3. "update" — user is changing their availability, requesting a time change, dropping a slot,
-   or any other schedule modification. This includes relative requests like "push my slot back
-   30 minutes" or "move me earlier on Day 1".
+   or any other schedule modification for a TRACKED day. Includes relative requests like
+   "push my slot back 30 minutes".
    IMPORTANT: Identify which days are being modified. Only include days the user explicitly
    mentions or clearly intends to change. If they say "set Day 2 to 3-5 UTC", days_modified
    is [2] — do NOT include Day 1 or Day 4.
-   Rewrite ONLY the modified days as an availability statement. Do NOT rewrite days the user
-   didn't mention.
+   Rewrite ONLY the modified days as an availability statement.
    {{"type": "update", "days_modified": [2], "rewritten_availability": "Day 2: 3-5 UTC only", "details": "brief description"}}
 
-4. "nonsense" — the message is clearly a joke, trolling, irrelevant, or makes no sense as a
-   scheduling request. The user is not genuinely trying to interact with the scheduler.
-   {{"type": "nonsense", "details": "brief description of what they said"}}
+4. "off_day" — message references Day 3 or Day 5 in a scheduling context.
+   {{"type": "off_day", "days": [3]}}
 
-5. "unclear" — you genuinely can't determine whether they want a query, update, or swap
-   {{"type": "unclear", "details": "what was confusing"}}
+5. "other" — message is a joke, irrelevant, or doesn't fit any category above. Used for
+   anything not a genuine scheduling interaction.
+   {{"type": "other"}}
 
 Respond with ONLY the JSON object. No explanation.
 """
@@ -158,11 +158,13 @@ class Changes(commands.Cog):
             rewritten = result.get("rewritten_availability", text_content)
             days_modified = result.get("days_modified", None)
             await self._handle_availability_update(message, day1, rewritten, days_modified)
-        elif req_type == "nonsense":
-            await self._handle_nonsense(message, result.get("details", ""))
+        elif req_type == "off_day":
+            from bot.llm.utils import off_day_reply
+            await message.reply(off_day_reply(result.get("days", [])))
         else:
+            # "other" or anything else falls through to the basic prompt
             await message.reply(
-                "I wasn't sure what you meant. You can:\n"
+                "You can:\n"
                 "• \"What are my current times?\"\n"
                 "• \"Push my Day 1 spot back by 30 minutes\"\n"
                 "• \"Swap Day 2 with @player\"\n"
@@ -264,12 +266,6 @@ class Changes(commands.Cog):
             lines.append(f"\n**Availability on file:** {submission.raw_availability_text}")
 
         await message.reply("\n".join(lines))
-
-    async def _handle_nonsense(self, message: discord.Message, details: str):
-        """Respond to nonsense/joke messages with personality."""
-        from bot.llm.utils import generate_witty_response
-        reply = await generate_witty_response(message.content)
-        await message.reply(reply)
 
     async def _handle_resource_update(self, message: discord.Message, day1: datetime):
         """Process a new screenshot submission after lock."""

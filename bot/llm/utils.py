@@ -1,10 +1,9 @@
 """
-Shared utilities for LLM response parsing, message classification, and bot personality.
+Shared utilities for LLM response parsing and message classification.
 """
 
 import json
 import logging
-import random
 import re
 
 import anthropic
@@ -68,76 +67,66 @@ def extract_json(text: str) -> dict | None:
 
 TRIAGE_PROMPT = """You are triaging messages for a game scheduling bot. The user @mentioned the bot.
 
-Players refer to days by resource type:
+Tracked days: Day 1, Day 2, Day 4 only. Players refer to days by resource type:
 - "construction" / "building" = Day 1
 - "research" = Day 2
 - "troops" / "training" / "soldiers" = Day 4
 "Reset" means 0:00 UTC.
 
-Classify the message:
-1. "availability" — providing or updating available times for scheduling. Includes partial
-   updates like "change Day 2 to after 19 UTC". When in doubt, choose this — the downstream
-   parser will handle errors gracefully.
+Untracked days: Day 3 and Day 5. The bot does not handle these.
+
+Classify the message into one type:
+1. "availability" — providing or updating available times for Day 1, 2, or 4. Includes
+   partial updates like "change Day 2 to after 19 UTC". When in doubt, choose this.
 2. "query" — asking about their current data, times, speedups, status, or how the bot works.
    NOT a request to change anything.
-3. "nonsense" — joke, trolling, venting, irrelevant chatter, or anything that isn't a genuine
-   scheduling interaction.
+3. "off_day" — message references Day 3 or Day 5 in a scheduling context (they appear to
+   be giving availability or asking about a slot for an untracked day).
+4. "other" — anything that doesn't fit above (jokes, irrelevant chatter, unclear messages).
 
-Respond with ONLY: {"type": "availability"} or {"type": "query"} or {"type": "nonsense"}
+Respond with ONLY one of:
+{"type": "availability"}
+{"type": "query"}
+{"type": "off_day", "days": [3]}
+{"type": "other"}
 """
 
 
-async def classify_message(text: str) -> str:
+async def classify_message(text: str) -> dict:
     """
-    Classify a user's text message into: availability, query, or nonsense.
-    Returns the type string. Defaults to 'availability' on failure.
+    Classify a user's text message.
+    Returns the parsed result dict with at least a 'type' key.
+    Defaults to {'type': 'availability'} on failure — parse_availability handles bad input.
     """
     try:
         response = await client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=50,
+            max_tokens=80,
             system=TRIAGE_PROMPT,
             messages=[{"role": "user", "content": text}],
         )
         result = extract_json(response.content[0].text.strip())
         if result and "type" in result:
-            return result["type"]
+            return result
     except Exception as e:
         logger.error(f"Message classification failed: {e}")
 
-    return "availability"  # Safe default — parse_availability handles bad input
+    return {"type": "availability"}
 
 
-# ─── Witty Nonsense Responses ────────────────────────────────────
+# ─── Standard Responses ─────────────────────────────────────────
 
-_FALLBACK_RESPONSES = [
-    "Bro I literally only do one thing and it's not this.",
-    "Tell me your times or tell it to someone who cares.",
-    "Cool story. Now send your availability.",
-    "I'm going to pretend I didn't see that.",
-    "Sir this is a scheduling bot.",
-    "Rent free in your head and you're not even on the schedule yet.",
-]
+BASIC_PROMPT_REPLY = (
+    "I help with scheduling. @mention me with a screenshot of your resources "
+    "and/or your available times for Day 1, Day 2, and Day 4 (in UTC)."
+)
 
 
-async def generate_witty_response(message_text: str) -> str:
-    """
-    Generate a short, punchy roast in response to a nonsense message.
-    Falls back to a canned response if the LLM call fails.
-    """
-    try:
-        response = await client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=60,
-            system=(
-                "You're a scheduling bot with the energy of a tired reddit commenter. "
-                "A user just @mentioned you with something completely irrelevant. "
-                "Roast them in ONE short sentence. Think twitter/instagram comment "
-                "energy — punchy, casual, a little mean but not cruel. No emojis. "
-                "No quotation marks. Don't explain what you do. Just clap back."
-            ),
-            messages=[{"role": "user", "content": message_text}],
-        )
-        return response.content[0].text.strip()
-    except Exception:
-        return random.choice(_FALLBACK_RESPONSES)
+def off_day_reply(days: list[int]) -> str:
+    """Build the response for messages referencing untracked Day 3 or Day 5."""
+    day_str = " and ".join(f"Day {d}" for d in sorted(set(days))) if days else "Day 3 or Day 5"
+    return (
+        f"You mentioned {day_str}, which I don't track — only Day 1, Day 2, and Day 4.\n"
+        f"If that was a mistake, send your correct availability. "
+        f"If it was intentional, please contact an admin."
+    )
