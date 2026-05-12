@@ -25,7 +25,7 @@ from bot.cycle import (
 )
 from bot.llm.screenshot import parse_screenshot
 from bot.llm.availability import parse_availability
-from bot.llm.utils import classify_message, off_day_reply, BASIC_PROMPT_REPLY
+from bot.llm.utils import classify_message, off_day_reply, BASIC_PROMPT_REPLY, RESOURCE_CHANGE_REPLY
 
 logger = logging.getLogger("scheduler.submissions")
 
@@ -203,6 +203,10 @@ class Submissions(commands.Cog):
                     await self._handle_query(message, submission)
                     return
 
+                if text_type == "resource_change" and screenshot_result is None:
+                    await message.reply(RESOURCE_CHANGE_REPLY)
+                    return
+
                 if text_type == "off_day" and screenshot_result is None:
                     await message.reply(off_day_reply(triage.get("days", [])))
                     return
@@ -259,25 +263,33 @@ class Submissions(commands.Cog):
                 else:
                     new_slots = availability_result["available_slots"]
 
-                    # Merge: keep existing slots for days not mentioned
-                    existing_slots = submission.availability or []
-                    if existing_slots and new_slots:
-                        new_days = {sid.split("-")[0] for sid in new_slots}
-                        old_days = {sid.split("-")[0] for sid in existing_slots}
-                        unmentioned_days = old_days - new_days
-                        if unmentioned_days:
-                            kept = [
-                                sid for sid in existing_slots
-                                if sid.split("-")[0] in unmentioned_days
-                            ]
-                            new_slots = sorted(set(kept + new_slots))
+                    # Safety: if parser returned no slots, don't wipe existing data
+                    if not new_slots:
+                        response_lines.append(
+                            f"**Availability:** I couldn't extract any specific times from that. "
+                            f"Please describe your available times for Day 1, Day 2, and/or Day 4 "
+                            f"(e.g., \"Day 1 after 14 UTC, Day 2 anytime\")."
+                        )
+                    else:
+                        # Merge: keep existing slots for days not mentioned
+                        existing_slots = submission.availability or []
+                        if existing_slots:
+                            new_days = {sid.split("-")[0] for sid in new_slots}
+                            old_days = {sid.split("-")[0] for sid in existing_slots}
+                            unmentioned_days = old_days - new_days
+                            if unmentioned_days:
+                                kept = [
+                                    sid for sid in existing_slots
+                                    if sid.split("-")[0] in unmentioned_days
+                                ]
+                                new_slots = sorted(set(kept + new_slots))
 
-                    submission.availability = new_slots
-                    submission.has_availability = True
-                    submission.raw_availability_text = text_content
-                    summary = availability_result.get("player_summary", "")
-                    response_lines.append(f"**Availability:**\n{summary}")
-                    availability_ok = True
+                        submission.availability = new_slots
+                        submission.has_availability = True
+                        submission.raw_availability_text = text_content
+                        summary = availability_result.get("player_summary", "")
+                        response_lines.append(f"**Availability:**\n{summary}")
+                        availability_ok = True
 
             # Nothing processed
             if not response_lines:
@@ -304,7 +316,7 @@ class Submissions(commands.Cog):
             if has_error:
                 status = "❌"
             elif missing:
-                status = "⏳"
+                status = "🚨"
             else:
                 status = "✅"
 
@@ -312,8 +324,9 @@ class Submissions(commands.Cog):
 
             if missing:
                 body += (
-                    f"\n\nI still need {' and '.join(missing)}. "
-                    f"Just @mention me again with the missing info."
+                    f"\n\n🚨 **YOUR SUBMISSION IS INCOMPLETE** 🚨\n"
+                    f"I still need {' and '.join(missing)}.\n"
+                    f"**Please @mention me again with the missing info or you won't be scheduled.**"
                 )
             elif not has_error:
                 body += "\n\nSubmission complete — to update anything, just @mention me again."

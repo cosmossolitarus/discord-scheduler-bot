@@ -77,6 +77,94 @@ class Changes(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # ─── Formatting helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _track_name(track: str) -> str:
+        """Convert internal track code to display name."""
+        return "Noble Advisor" if track == "NA" else "Chief Minister"
+
+    @staticmethod
+    def _format_slot(slot: Slot) -> str:
+        """Format a Slot object as 'Day X - Track - HH:MM UTC'."""
+        return (
+            f"Day {slot.day} - {Changes._track_name(slot.track)} - "
+            f"{slot.start_time.strftime('%H:%M UTC')}"
+        )
+
+    async def _format_slot_ids(self, slot_ids: list[str], event_id: int) -> list[str]:
+        """Convert a list of internal slot IDs into human-readable strings."""
+        if not slot_ids:
+            return []
+        async with async_session() as session:
+            result = await session.execute(
+                select(Slot).where(
+                    Slot.event_id == event_id,
+                    Slot.slot_id.in_(slot_ids),
+                ).order_by(Slot.day, Slot.start_time)
+            )
+            slots = list(result.scalars().all())
+        return [self._format_slot(s) for s in slots]
+
+    async def _summarize_availability_change(
+        self, old_ids: list[str], new_ids: list[str], event_id: int,
+        days_modified: list[int] | None,
+    ) -> str:
+        """Build a short human-readable summary of an availability change.
+
+        Shows added and removed windows per day for the modified days.
+        """
+        old_set = set(old_ids or [])
+        new_set = set(new_ids or [])
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
+
+        if not added and not removed:
+            return "No effective change in available slots."
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Slot).where(
+                    Slot.event_id == event_id,
+                    Slot.slot_id.in_(list(added) + list(removed)),
+                )
+            )
+            slot_map = {s.slot_id: s for s in result.scalars().all()}
+
+        def windows(slot_ids: list[str]) -> dict:
+            """Group contiguous slots into time windows per day."""
+            by_day = {}
+            for sid in slot_ids:
+                slot = slot_map.get(sid)
+                if slot:
+                    by_day.setdefault(slot.day, []).append(slot)
+            for day, slots in by_day.items():
+                slots.sort(key=lambda s: s.start_time)
+            return by_day
+
+        added_by_day = windows(added)
+        removed_by_day = windows(removed)
+
+        lines = []
+        days_to_show = days_modified or sorted(set(added_by_day.keys()) | set(removed_by_day.keys()))
+        for day in days_to_show:
+            day_added = added_by_day.get(day, [])
+            day_removed = removed_by_day.get(day, [])
+            if not day_added and not day_removed:
+                continue
+            line = f"Day {day}: "
+            parts = []
+            if day_added:
+                start = day_added[0].start_time.strftime("%H:%M")
+                end = day_added[-1].end_time.strftime("%H:%M UTC")
+                parts.append(f"now available {start}-{end}")
+            if day_removed:
+                start = day_removed[0].start_time.strftime("%H:%M")
+                end = day_removed[-1].end_time.strftime("%H:%M UTC")
+                parts.append(f"no longer available {start}-{end}")
+            lines.append(line + "; ".join(parts))
+        return "\n".join(lines) if lines else "No effective change."
+
     async def handle_change_request(self, message: discord.Message, day1: datetime):
         """
         Entry point for post-lock @mentions.
@@ -147,7 +235,8 @@ class Changes(commands.Cog):
                     message.guild.members,
                 )
             if other_member:
-                await self._handle_swap_request(message, day1, other_member)
+                requested_day = result.get("day")
+                await self._handle_swap_request(message, day1, other_member, requested_day)
             else:
                 await message.reply(
                     f"I think you want to swap with **{other_name}**, but I couldn't "
@@ -431,7 +520,7 @@ class Changes(commands.Cog):
                     "old_availability": old_availability,
                     "new_availability": merged,
                     "days_modified": days_modified,
-                    "interpretation": avail_result.get("interpretation", ""),
+                    "player_summary": avail_result.get("player_summary", ""),
                 },
             )
             session.add(change)
@@ -446,22 +535,27 @@ class Changes(commands.Cog):
 
             await session.commit()
 
-            interp = avail_result.get("interpretation", "")
+            player_summary = avail_result.get("player_summary", "")
             days_str = (
                 f" (Day {', '.join(str(d) for d in days_modified)})"
                 if days_modified else ""
             )
             await message.reply(
-                f"⏳ Availability update{days_str}: {interp}\n"
+                f"⏳ Availability update{days_str}:\n{player_summary}\n\n"
                 f"Your request is **pending admin approval**."
             )
 
             await self._post_approval_request(message.guild, change, event, submission)
 
     async def _handle_swap_request(
-        self, message: discord.Message, day1: datetime, other_user: discord.Member
+        self, message: discord.Message, day1: datetime, other_user: discord.Member,
+        requested_day: int | None = None,
     ):
-        """Process a swap request between two users."""
+        """Process a swap request between two users.
+
+        If requested_day is provided (from classifier), use it to narrow down
+        which day to swap when multiple are shared.
+        """
         async with async_session() as session:
             event = await self._get_event(session, day1)
             if event is None:
@@ -494,13 +588,24 @@ class Changes(commands.Cog):
                 )
                 return
 
-            # For simplicity, if there's exactly one common day/track, use it.
-            # Otherwise, ask for clarification.
+            # If user specified a day, filter to that day
+            if requested_day is not None:
+                filtered = {dt for dt in common if dt[0] == requested_day}
+                if not filtered:
+                    shared_days = sorted({d for d, _ in common})
+                    await message.reply(
+                        f"You and {other_user.display_name} don't share a Day {requested_day} "
+                        f"slot. You share: Day {', Day '.join(str(d) for d in shared_days)}."
+                    )
+                    return
+                common = filtered
+
+            # If multiple still match, ask for clarification
             if len(common) > 1:
-                days_str = ", ".join(f"Day {d} {t}" for d, t in sorted(common))
+                days_str = ", ".join(f"Day {d} {self._track_name(t)}" for d, t in sorted(common))
                 await message.reply(
-                    f"You and {other_user.display_name} share multiple days: {days_str}. "
-                    f"Please specify which day, e.g., "
+                    f"You and {other_user.display_name} share multiple slots: {days_str}. "
+                    f"Please specify which one, e.g., "
                     f"\"@scheduler swap Day 1 with @{other_user.display_name}\""
                 )
                 return
@@ -557,10 +662,11 @@ class Changes(commands.Cog):
             # Echo in channel
             req_time = req_assignment.slot.start_time.strftime("%H:%M UTC")
             other_time = other_assignment.slot.start_time.strftime("%H:%M UTC")
+            track_label = self._track_name(day_track[1])
             await message.reply(
                 f"Swap request: your {req_time} slot ↔ "
                 f"{other_user.mention}'s {other_time} slot on "
-                f"Day {day_track[0]} ({day_track[1]}).\n"
+                f"Day {day_track[0]} ({track_label}).\n"
                 f"Waiting for {other_user.display_name} to confirm."
             )
 
@@ -570,7 +676,7 @@ class Changes(commands.Cog):
                 dm_msg = await other_user.send(
                     f"**Swap request from {message.author.display_name}:**\n"
                     f"Your {other_time} slot ↔ their {req_time} slot on "
-                    f"Day {day_track[0]} ({day_track[1]})\n\n"
+                    f"Day {day_track[0]} ({track_label})\n\n"
                     f"React ✅ to accept or ❌ to decline.\n"
                     f"Deadline: {deadline_str}"
                 )
@@ -845,9 +951,11 @@ class Changes(commands.Cog):
         desc += f"Type: {change.change_type.value}\n"
 
         if details.get("type") == "resource_update":
-            desc += f"Priorities: Day 1={details['new_priorities']['x']:.1f}d, "
-            desc += f"Day 2={details['new_priorities']['y']:.1f}d, "
-            desc += f"Day 4={details['new_priorities']['z']:.1f}d\n"
+            desc += (
+                f"Priorities: Day 1 = {details['new_priorities']['x']:.1f}d, "
+                f"Day 2 = {details['new_priorities']['y']:.1f}d, "
+                f"Day 4 = {details['new_priorities']['z']:.1f}d\n"
+            )
             if details.get("bump_opportunities"):
                 for bump in details["bump_opportunities"]:
                     desc += (
@@ -856,7 +964,16 @@ class Changes(commands.Cog):
                         f"2x current lowest {bump['bumped_priority']:,.0f}\n"
                     )
         elif details.get("type") == "availability_update":
-            desc += f"Interpretation: {details.get('interpretation', 'N/A')}\n"
+            summary_text = await self._summarize_availability_change(
+                details.get("old_availability", []),
+                details.get("new_availability", []),
+                event.event_id,
+                details.get("days_modified"),
+            )
+            player_summary = details.get("player_summary", "")
+            if player_summary:
+                desc += f"Player said: {player_summary}\n"
+            desc += f"Changes:\n{summary_text}\n"
 
         desc += f"\nReact ✅ to approve or ❌ to reject."
 
@@ -866,7 +983,6 @@ class Changes(commands.Cog):
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
 
-        # Store the message ID
         async with async_session() as session2:
             change_obj = await session2.get(ChangeRequest, change.change_id)
             change_obj.approval_message_id = msg.id
@@ -886,13 +1002,31 @@ class Changes(commands.Cog):
         req_name = requester.display_name if requester else str(details["requester_id"])
         other_name = other.display_name if other else str(details["other_id"])
 
-        deadline_str = change.admin_deadline.strftime("%b %d, %H:%M UTC") if change.admin_deadline else "N/A"
+        # Look up actual slot times for both sides
+        async with async_session() as session:
+            result = await session.execute(
+                select(Slot).where(
+                    Slot.event_id == change.event_id,
+                    Slot.slot_id.in_([details["requester_slot"], details["other_slot"]]),
+                )
+            )
+            slot_map = {s.slot_id: s for s in result.scalars().all()}
+
+        req_slot = slot_map.get(details["requester_slot"])
+        other_slot = slot_map.get(details["other_slot"])
+        req_time = req_slot.start_time.strftime("%H:%M UTC") if req_slot else "?"
+        other_time = other_slot.start_time.strftime("%H:%M UTC") if other_slot else "?"
+        track_label = self._track_name(details["track"])
+
+        deadline_str = (
+            change.admin_deadline.strftime("%b %d, %H:%M UTC")
+            if change.admin_deadline else "N/A"
+        )
 
         desc = (
             f"**Swap Request #{change.change_id}**\n"
-            f"{req_name} ({details['requester_slot']}) ↔ "
-            f"{other_name} ({details['other_slot']})\n"
-            f"Day {details['day']} ({details['track']})\n"
+            f"@{req_name} ({req_time}) ↔ @{other_name} ({other_time})\n"
+            f"Day {details['day']} ({track_label})\n"
             f"Both players confirmed.\n"
             f"Admin deadline: {deadline_str}\n\n"
             f"React ✅ to approve or ❌ to reject."
@@ -910,31 +1044,87 @@ class Changes(commands.Cog):
     async def _notify_change_result(self, change: ChangeRequest, approved: bool):
         """DM affected users about the result of a change."""
         status_word = "approved" if approved else "declined"
+        details = change.details
+
+        # Build a description of what changed
+        change_desc = ""
+        if change.change_type == ChangeType.UPDATE:
+            if details.get("type") == "availability_update":
+                # Look up before/after times in human form
+                summary_text = await self._summarize_availability_change(
+                    details.get("old_availability", []),
+                    details.get("new_availability", []),
+                    change.event_id,
+                    details.get("days_modified"),
+                )
+                player_summary = details.get("player_summary", "")
+                if player_summary:
+                    change_desc = f"\n**Your request:** {player_summary}\n**Changes:**\n{summary_text}"
+                else:
+                    change_desc = f"\n**Changes:**\n{summary_text}"
+            elif details.get("type") == "resource_update":
+                np = details.get("new_priorities", {})
+                change_desc = (
+                    f"\n**New priorities:** "
+                    f"Day 1 = {np.get('x', 0):.1f}d, "
+                    f"Day 2 = {np.get('y', 0):.1f}d, "
+                    f"Day 4 = {np.get('z', 0):.1f}d"
+                )
 
         for guild in self.bot.guilds:
             if change.change_type == ChangeType.SWAP:
-                details = change.details
+                # Build human-readable swap description
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(Slot).where(
+                            Slot.event_id == change.event_id,
+                            Slot.slot_id.in_([
+                                details["requester_slot"],
+                                details["other_slot"],
+                            ]),
+                        )
+                    )
+                    slot_map = {s.slot_id: s for s in result.scalars().all()}
+
+                req_slot = slot_map.get(details["requester_slot"])
+                other_slot = slot_map.get(details["other_slot"])
+                track_label = self._track_name(details["track"])
+
                 for user_id in [details["requester_id"], details["other_id"]]:
                     member = guild.get_member(user_id)
-                    if member:
-                        try:
-                            if approved:
-                                await member.send(
-                                    f"Your swap on Day {details['day']} has been {status_word} "
-                                    f"and implemented."
-                                )
-                            else:
-                                await member.send(
-                                    f"The swap request on Day {details['day']} was {status_word}."
-                                )
-                        except discord.Forbidden:
-                            pass
+                    if not member:
+                        continue
+
+                    # Their original slot and the new one they get after swap
+                    if user_id == details["requester_id"]:
+                        old_time = req_slot.start_time.strftime("%H:%M UTC") if req_slot else "?"
+                        new_time = other_slot.start_time.strftime("%H:%M UTC") if other_slot else "?"
+                    else:
+                        old_time = other_slot.start_time.strftime("%H:%M UTC") if other_slot else "?"
+                        new_time = req_slot.start_time.strftime("%H:%M UTC") if req_slot else "?"
+
+                    try:
+                        if approved:
+                            await member.send(
+                                f"Your swap on Day {details['day']} ({track_label}) "
+                                f"has been **{status_word}** and applied.\n"
+                                f"Your new slot: **{new_time}** (was {old_time})."
+                            )
+                        else:
+                            await member.send(
+                                f"Your swap request on Day {details['day']} "
+                                f"({track_label}) was **{status_word}**.\n"
+                                f"Your slot remains at {old_time}."
+                            )
+                    except discord.Forbidden:
+                        pass
             else:
                 member = guild.get_member(change.requested_by)
                 if member:
                     try:
                         await member.send(
-                            f"Your change request (#{change.change_id}) has been {status_word}."
+                            f"Your change request (#{change.change_id}) has been "
+                            f"**{status_word}**.{change_desc}"
                         )
                     except discord.Forbidden:
                         pass

@@ -240,29 +240,16 @@ class Scheduling(commands.Cog):
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow([
-            "Day", "Track", "Slot", "Start (UTC)", "End (UTC)",
-            "Player", "Speedup (days)", "Priority (days)", "Status",
-        ])
+        writer.writerow(["Day", "Minister Position", "Player", "Time"])
 
         for assignment, slot, submission in rows:
-            if slot.day in (1, 2):
-                resource_key = "x" if slot.day == 1 else "y"
-            else:
-                resource_key = "z"
-            resource_val = getattr(submission, f"resource_{resource_key}", 0) or 0
-            priority_val = getattr(submission, f"priority_{resource_key}", 0) or 0
-
+            position = "Noble Advisor" if slot.track == "NA" else "Chief Minister"
+            time_str = slot.start_time.strftime("%H:%M UTC")
             writer.writerow([
                 slot.day,
-                slot.track,
-                slot.slot_id,
-                slot.start_time.strftime("%Y-%m-%d %H:%M"),
-                slot.end_time.strftime("%H:%M"),
+                position,
                 submission.discord_name,
-                f"{resource_val:.1f}",
-                f"{priority_val:.1f}",
-                assignment.status,
+                time_str,
             ])
 
         csv_bytes = output.getvalue().encode("utf-8")

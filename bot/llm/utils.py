@@ -76,17 +76,21 @@ Tracked days: Day 1, Day 2, Day 4 only. Players refer to days by resource type:
 Untracked days: Day 3 and Day 5. The bot does not handle these.
 
 Classify the message into one type:
-1. "availability" — providing or updating available times for Day 1, 2, or 4. Includes
+1. "availability" — providing or updating available TIMES for Day 1, 2, or 4. Includes
    partial updates like "change Day 2 to after 19 UTC". When in doubt, choose this.
 2. "query" — asking about their current data, times, speedups, status, or how the bot works.
    NOT a request to change anything.
-3. "off_day" — message references Day 3 or Day 5 in a scheduling context (they appear to
+3. "resource_change" — trying to manually edit their resource/speedup values without a
+   screenshot. Examples: "set my research speedups to 10 days", "add 2 days more to troops",
+   "I have 5 days of construction speedups". Resources MUST come from screenshots, not text.
+4. "off_day" — message references Day 3 or Day 5 in a scheduling context (they appear to
    be giving availability or asking about a slot for an untracked day).
-4. "other" — anything that doesn't fit above (jokes, irrelevant chatter, unclear messages).
+5. "other" — anything that doesn't fit above (jokes, irrelevant chatter, unclear messages).
 
 Respond with ONLY one of:
 {"type": "availability"}
 {"type": "query"}
+{"type": "resource_change"}
 {"type": "off_day", "days": [3]}
 {"type": "other"}
 """
@@ -119,6 +123,11 @@ async def classify_message(text: str) -> dict:
 BASIC_PROMPT_REPLY = (
     "I help with scheduling. @mention me with a screenshot of your resources "
     "and/or your available times for Day 1, Day 2, and Day 4 (in UTC)."
+)
+
+RESOURCE_CHANGE_REPLY = (
+    "I can't update speedup values from text — they have to come from a screenshot of "
+    "your resources page in-game. Please send a new screenshot if your values changed."
 )
 
 
