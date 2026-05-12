@@ -80,6 +80,30 @@ class Changes(commands.Cog):
     # ─── Formatting helpers ─────────────────────────────────────
 
     @staticmethod
+    def _extract_day_from_text(text: str) -> int | None:
+        """Best-effort regex extraction of a day number from a swap message.
+
+        Handles 'day 4', 'd4', and resource aliases (construction/research/troops).
+        Returns None if no day reference found.
+        """
+        import re
+        if not text:
+            return None
+        lower = text.lower()
+        # "day N" or "d N" or "dN"
+        match = re.search(r"\b(?:day|d)\s*([124])\b", lower)
+        if match:
+            return int(match.group(1))
+        # Resource aliases
+        if any(w in lower for w in ("construction", "build", "building")):
+            return 1
+        if "research" in lower:
+            return 2
+        if any(w in lower for w in ("troops", "troop", "training", "soldier", "soldiers")):
+            return 4
+        return None
+
+    @staticmethod
     def _track_name(track: str) -> str:
         """Convert internal track code to display name."""
         return "Noble Advisor" if track == "NA" else "Chief Minister"
@@ -188,10 +212,15 @@ class Changes(commands.Cog):
             await self._handle_resource_update(message, day1)
             return
 
-        # Direct @mention of another user → straight to swap
+        # Direct @mention of another user → straight to swap.
+        # Try to extract the day from the message text so the swap handler
+        # can filter when both users share multiple day/track combos.
         other_mentions = [m for m in message.mentions if m.id != self.bot.user.id]
         if other_mentions:
-            await self._handle_swap_request(message, day1, other_mentions[0])
+            requested_day = self._extract_day_from_text(text_content)
+            await self._handle_swap_request(
+                message, day1, other_mentions[0], requested_day
+            )
             return
 
         # Look up current assignments for LLM context
@@ -235,7 +264,14 @@ class Changes(commands.Cog):
                     message.guild.members,
                 )
             if other_member:
-                requested_day = result.get("day")
+                raw_day = result.get("day")
+                try:
+                    requested_day = int(raw_day) if raw_day is not None else None
+                except (TypeError, ValueError):
+                    requested_day = None
+                # Fallback: try extracting from text if classifier didn't give it
+                if requested_day is None:
+                    requested_day = self._extract_day_from_text(text_content)
                 await self._handle_swap_request(message, day1, other_member, requested_day)
             else:
                 await message.reply(

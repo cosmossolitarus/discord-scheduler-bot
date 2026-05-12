@@ -44,9 +44,11 @@ The user will describe their availability in free text. They may use:
 - Time ranges ("10am to 6pm", "14:00-18:00", "after 3pm", "all day")
 - Timezone names ("3pm EST", "10am PST") — convert these to UTC
 - General phrases ("anytime", "morning", "evening", "not available")
-- "reset" or "daily reset" — this means exactly 0:00 UTC. So "just after reset" means
-  roughly 0:00-3:00 UTC, "before reset" means the hours before midnight UTC, and
-  "around reset" means a window on either side of 0:00 UTC.
+
+Reset-related phrases have STRICT meanings:
+- "close to reset", "near reset", "around reset (before)", "late" (in context of end of day) → 21:15 - 00:15 UTC
+- "after reset", "just after reset", "around reset (after)", "early" (in context of start of day) → 23:45 (previous day) - 02:45 UTC
+- "reset" by itself means exactly 0:00 UTC
 
 IMPORTANT — Players often refer to days by their resource type instead of number:
 - "construction" / "building" = Day 1
@@ -61,11 +63,19 @@ Day 1, Day 2, and Day 4 when building the slot list.
 Your job: determine which slot IDs the user is available for.
 
 Respond with ONLY a JSON object, no markdown, no explanation:
-{{"available_slots": ["D1-CM-01", "D1-CM-02", ...], "interpretation": "detailed log of what you understood", "player_summary": "brief 1-3 line summary for the player"}}
+{{"available_slots": ["D1-CM-01", "D1-CM-02", ...], "interpretation": "detailed log of what you understood", "player_summary": "formatted summary for the player"}}
 
-The player_summary should be SHORT and use the player's own language/terms. One line per day.
-Example: "Day 1: Before 9am EST / around reset\nDay 2: Not available\nDay 4: After 16 UTC"
-Do NOT include slot IDs, slot counts, or UTC conversions in the player_summary.
+The player_summary format: one line per day the user mentioned, with the actual UTC slot
+time range followed by the player's own phrasing in parentheses. Use HH:MM UTC format.
+For multiple windows on the same day, separate with commas.
+
+Example formats:
+"Day 1: 00:00 - 23:45 UTC (anytime)"
+"Day 2: 19:00 - 23:00 UTC (2-6pm EST)"
+"Day 4: 21:15 - 00:15 UTC (late, close to reset)"
+"Day 1: 08:00 - 12:00 UTC, 16:00 - 20:00 UTC (mornings and evenings)"
+
+Always use 24-hour HH:MM UTC. Never include slot IDs or slot counts in the player_summary.
 
 If the input is nonsensical or you cannot parse it:
 {{"error": "description of what went wrong"}}

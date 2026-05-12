@@ -42,12 +42,17 @@ def optimize_pass(
     epsilon = 0.001 / max_slot_index if max_slot_index > 0 else 0.001
 
     LARGE = 1e12
+    # Tiny floor so 0-priority users still compete weakly for leftover slots
+    # rather than being filtered out entirely.
+    FLOOR = 1e-6
+
     cost_matrix = np.full((n_users, n_slots), LARGE)
 
     for i, user in enumerate(users):
         for j, slot in enumerate(slots):
             if slot.slot_id in user.available_slots:
-                weight = user.priority + epsilon * slot.slot_index * user.priority
+                effective_priority = max(user.priority, FLOOR)
+                weight = effective_priority + epsilon * slot.slot_index * effective_priority
                 cost_matrix[i, j] = -weight
 
     row_indices, col_indices = linear_sum_assignment(cost_matrix)
@@ -72,15 +77,15 @@ def run_full_optimization(
     results = {}
 
     # Pass 1: Day 1 CM
+    d1_slot_set = {sl.slot_id for sl in slots_by_pass["D1-CM"]}
     d1_users = [
         UserForOptimizer(
             discord_id=s["discord_id"],
             priority=s["priority_x"],
-            available_slots=s["availability"] & {sl.slot_id for sl in slots_by_pass["D1-CM"]},
+            available_slots=s["availability"] & d1_slot_set,
         )
         for s in submissions
-        if s["priority_x"] > 0
-        and s["availability"] & {sl.slot_id for sl in slots_by_pass["D1-CM"]}
+        if s["availability"] & d1_slot_set
     ]
     results["D1-CM"] = optimize_pass(d1_users, slots_by_pass["D1-CM"])
 
@@ -92,16 +97,16 @@ def run_full_optimization(
             break
 
     # Pass 2: Day 2 CM
+    d2_slot_set = {sl.slot_id for sl in slots_by_pass["D2-CM"]}
     d2_users = [
         UserForOptimizer(
             discord_id=s["discord_id"],
             priority=s["priority_y"],
-            available_slots=s["availability"] & {sl.slot_id for sl in slots_by_pass["D2-CM"]},
+            available_slots=s["availability"] & d2_slot_set,
         )
         for s in submissions
-        if s["priority_y"] > 0
-        and s["discord_id"] != boundary_player
-        and s["availability"] & {sl.slot_id for sl in slots_by_pass["D2-CM"]}
+        if s["discord_id"] != boundary_player
+        and s["availability"] & d2_slot_set
     ]
     results["D2-CM"] = optimize_pass(d2_users, slots_by_pass["D2-CM"])
 
@@ -118,30 +123,30 @@ def run_full_optimization(
         results["boundary"] = []
 
     # Pass 3: Day 4 NA (priority track)
+    d4na_slot_set = {sl.slot_id for sl in slots_by_pass["D4-NA"]}
     d4na_users = [
         UserForOptimizer(
             discord_id=s["discord_id"],
             priority=s["priority_z"],
-            available_slots=s["availability"] & {sl.slot_id for sl in slots_by_pass["D4-NA"]},
+            available_slots=s["availability"] & d4na_slot_set,
         )
         for s in submissions
-        if s["priority_z"] > 0
-        and s["availability"] & {sl.slot_id for sl in slots_by_pass["D4-NA"]}
+        if s["availability"] & d4na_slot_set
     ]
     results["D4-NA"] = optimize_pass(d4na_users, slots_by_pass["D4-NA"])
 
     # Pass 4: Day 4 CM (exclude Pass 3 players)
     assigned_d4na = {r.discord_id for r in results["D4-NA"]}
+    d4cm_slot_set = {sl.slot_id for sl in slots_by_pass["D4-CM"]}
     d4cm_users = [
         UserForOptimizer(
             discord_id=s["discord_id"],
             priority=s["priority_z"],
-            available_slots=s["availability"] & {sl.slot_id for sl in slots_by_pass["D4-CM"]},
+            available_slots=s["availability"] & d4cm_slot_set,
         )
         for s in submissions
-        if s["priority_z"] > 0
-        and s["discord_id"] not in assigned_d4na
-        and s["availability"] & {sl.slot_id for sl in slots_by_pass["D4-CM"]}
+        if s["discord_id"] not in assigned_d4na
+        and s["availability"] & d4cm_slot_set
     ]
     results["D4-CM"] = optimize_pass(d4cm_users, slots_by_pass["D4-CM"])
 
