@@ -50,6 +50,35 @@ _BASE_SYSTEM_PROMPT = """You are a scheduling bot for a 28-day game cycle. \
 You manage 30-minute time slots on Day 1, Day 2, and Day 4 only. \
 Day 3 and Day 5 are NOT tracked.
 
+## SUBMISSION COMPLETENESS — ABSOLUTE REQUIREMENT (pre-lock only)
+
+A player can ONLY be added to the schedule if BOTH of these are on file:
+  (1) Resource screenshot — extracted from a Resources & Speedups screenshot
+  (2) Availability — at least one window on Day 1, 2, or 4
+
+The state envelope tells you which (if any) are on file under "SUBMISSION:":
+  • "Screenshot on file: yes/no"
+  • "Availability on file: yes/no"
+
+When you reply to a user whose submission is incomplete (either piece missing):
+  - END your reply with a 🚨 warning naming the missing piece(s), IN THE USER'S LANGUAGE.
+  - Apply this whether or not you just took an action.
+
+NEVER use language like "signed you up", "scheduled you", "you're in", "added to the schedule" \
+unless BOTH pieces are on file. Players are only actually scheduled when the optimizer runs at lock time. \
+Use "recorded your availability" or "noted your resources" instead.
+
+Examples (mirror in user's language):
+  • User sets availability, has no screenshot →
+      "Recorded your availability for Day 1 (all day). 🚨 You still need to send a screenshot of \
+your in-game Resources & Speedups page — without it, I can't add you to the schedule."
+  • User sends a screenshot only, no availability →
+      "Got your resources. 🚨 You still need to tell me your availability for Day 1, Day 2, and \
+Day 4 before I can add you to the schedule."
+  • User updates Day 2, already has both →
+      "Updated your Day 2 availability." (no warning needed)
+  • User asks a question and is incomplete → answer the question, then 🚨 warn about what's missing.
+
 ## RESPONSE FORMAT — MANDATORY
 
 EVERY reply you produce MUST include a text block. Without a text block the user receives nothing.
@@ -380,6 +409,54 @@ def _synthesize_fallback(response_content) -> str:
     return "\n".join(parts).strip()
 
 
+# ─── Completeness warning (pre-lock backstop) ────────────────────
+
+
+async def _completeness_warning(
+    event: "Event",
+    user_id: int,
+) -> str | None:
+    """Return an English 🚨 warning if the user's submission is missing a piece.
+
+    Only applies during the COLLECTING phase. The system prompt instructs the
+    LLM to warn in the user's language; this function exists as a backstop
+    for when the LLM omits the warning. May produce a duplicate warning when
+    both fire — acceptable; a redundant warning is better than a missing one.
+
+    Returns None when:
+      - the event isn't COLLECTING
+      - no submission exists yet (LLM should already be nudging the user)
+      - both pieces are on file (submission is complete)
+    """
+    if event.phase != EventPhase.COLLECTING:
+        return None
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Submission).where(
+                Submission.event_id == event.event_id,
+                Submission.discord_id == user_id,
+            )
+        )
+        sub = result.scalar_one_or_none()
+
+    if sub is None:
+        return None
+    if sub.has_screenshot and sub.has_availability:
+        return None
+    if sub.has_availability and not sub.has_screenshot:
+        return (
+            "🚨 You still need to send a screenshot of your in-game "
+            "**Resources & Speedups** page — without it, I can't add you to the schedule."
+        )
+    if sub.has_screenshot and not sub.has_availability:
+        return (
+            "🚨 You still need to tell me your availability for Day 1, Day 2, and Day 4 "
+            "before I can add you to the schedule."
+        )
+    return None  # neither piece on file — the LLM's reply should be guiding them already
+
+
 # ─── Public entry point ─────────────────────────────────────────
 
 
@@ -425,6 +502,9 @@ async def process_user_message(
                 parts.append(f"🚨 Couldn't read the screenshot: {r['error']}")
             else:
                 parts.append(_format_screenshot_summary_en(r))
+        warning = await _completeness_warning(event, message.author.id)
+        if warning:
+            parts.append(warning)
         return "\n\n".join(parts)
 
     # Case C: text (with or without screenshot) — main LLM flow
@@ -492,11 +572,23 @@ async def process_user_message(
                 f"tool_uses={tool_names}"
             )
 
+    # Pre-lock completeness backstop. The system prompt instructs the LLM to
+    # warn in the user's language; this append catches misses. May produce a
+    # duplicate warning when both fire — acceptable trade-off.
+    completeness = await _completeness_warning(event, message.author.id)
+
     if not handler_errors:
-        return main_reply or "I processed your message but didn't generate a reply. Please try again."
+        final = main_reply or "I processed your message but didn't generate a reply. Please try again."
+        if completeness:
+            final = f"{final}\n\n{completeness}"
+        return final
 
     # Translate errors into the same language as the main reply
     translated_errors = await _translate_errors(text, main_reply, handler_errors)
     if main_reply:
-        return f"{main_reply}\n\n{translated_errors}"
-    return translated_errors
+        final = f"{main_reply}\n\n{translated_errors}"
+    else:
+        final = translated_errors
+    if completeness:
+        final = f"{final}\n\n{completeness}"
+    return final
