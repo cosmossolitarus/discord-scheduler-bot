@@ -71,6 +71,11 @@ Empty `windows` means "not available that day".
 - `move_slot` (post-lock): user wants to change the start time of an existing assignment. Compute \
 the absolute UTC time yourself for relative requests like "3 hours earlier".
 - `drop_slot` (post-lock): user wants to give up an assignment.
+- `request_new_slot` (post-lock): user does NOT have an assignment on the day they're asking about \
+and wants to be added to one (e.g. "can I get a Day 1 spot near reset", "sign me up for a Day 2 \
+slot at 7pm UTC", "add me to Day 4 Noble Advisor"). Check CURRENT STATE — only call this if the \
+user has no assignment for that day (or for Day 4, no assignment in the requested track). If \
+they already have an assignment on that day and want a different time, use `move_slot` instead.
 - `swap` (post-lock): user wants to trade slots with another player. Only call this if the user \
 @mentioned a player who appears in VALID SWAP PARTNERS in the state.
 - `query`: user is asking about their current state (their times, Speedups, status, deadlines).
@@ -296,6 +301,22 @@ def _render_drop_slot(inp: dict, state: dict) -> str:
             f"({current['start_utc']}-{current['end_utc']} UTC). Pending admin approval."
         )
     return f"Drop request submitted for **Day {day}**. Pending admin approval."
+
+
+def _render_request_new_slot(inp: dict) -> str:
+    day = inp.get("day")
+    new_time = inp.get("new_start_utc", "?")
+    track = inp.get("track")
+    if day == 4 and track in ("NA", "CM"):
+        track_label = "Noble Advisor" if track == "NA" else "Chief Minister"
+        return (
+            f"New-slot request submitted: **Day {day}** at **{new_time} UTC** "
+            f"({track_label}). Pending admin approval."
+        )
+    return (
+        f"New-slot request submitted: **Day {day}** at **{new_time} UTC**. "
+        f"Pending admin approval."
+    )
 
 
 def _render_swap(inp: dict, state: dict) -> str:
@@ -552,6 +573,8 @@ async def process_user_message(
                     action_lines.append(_render_move_slot(action_input, pre_state))
                 elif action_name == "drop_slot":
                     action_lines.append(_render_drop_slot(action_input, pre_state))
+                elif action_name == "request_new_slot":
+                    action_lines.append(_render_request_new_slot(action_input))
                 elif action_name == "swap":
                     action_lines.append(_render_swap(action_input, pre_state))
                 elif action_name in ("greet", "out_of_scope", "clarify"):

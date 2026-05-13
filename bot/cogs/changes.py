@@ -311,6 +311,58 @@ class Changes(commands.Cog):
             )
             return True, None
 
+        if action == "request_new_slot":
+            to_id = details["to_slot_id"]
+            user_id = change.requested_by
+
+            # Edge case: user already holds this slot (e.g. admin added them manually
+            # between request and approval). Nothing to do, just resolve.
+            self_check = await session.execute(
+                select(Assignment).where(
+                    Assignment.event_id == event_id,
+                    Assignment.slot_id == to_id,
+                    Assignment.discord_id == user_id,
+                )
+            )
+            if self_check.scalar_one_or_none() is not None:
+                return False, "user already has this slot"
+
+            # Re-check current occupant at approval time — may differ from request
+            # time (someone may have dropped/moved in the meantime).
+            existing = await session.execute(
+                select(Assignment).where(
+                    Assignment.event_id == event_id,
+                    Assignment.slot_id == to_id,
+                )
+            )
+            existing_assignment = existing.scalar_one_or_none()
+
+            bumped_user_id = None
+            if existing_assignment is not None:
+                bumped_user_id = existing_assignment.discord_id
+                await session.execute(
+                    Assignment.__table__.delete().where(
+                        Assignment.event_id == event_id,
+                        Assignment.slot_id == to_id,
+                    )
+                )
+                await session.flush()  # commit the delete before the insert
+
+            session.add(Assignment(
+                event_id=event_id,
+                discord_id=user_id,
+                slot_id=to_id,
+            ))
+
+            # Stash bumped_user_id so _dm_change_outcome can notify them too.
+            # JSON column requires reassignment to register the change.
+            if bumped_user_id is not None:
+                new_details = dict(details)
+                new_details["bumped_user_id"] = bumped_user_id
+                change.details = new_details
+
+            return True, None
+
         if action == "swap":
             a_id = details["user_a_id"]
             b_id = details["user_b_id"]
@@ -370,6 +422,29 @@ class Changes(commands.Cog):
             else:
                 msg = f"❌ Your request to drop your Day {day} assignment was declined."
             await self._dm_user(change.requested_by, msg)
+
+        elif action == "request_new_slot":
+            to_id = details.get("to_slot_id")
+            _, to_lbl = await self._look_up_two_slot_labels(None, to_id)
+            if approved:
+                await self._dm_user(
+                    change.requested_by,
+                    f"✅ You've been assigned to Day {day}: {to_lbl}.",
+                )
+                # If someone got bumped, notify them too.
+                bumped_id = details.get("bumped_user_id")
+                if bumped_id:
+                    await self._dm_user(
+                        bumped_id,
+                        f"🚨 Your Day {day} slot ({to_lbl}) was reassigned to another "
+                        f"player by admin. You no longer have a Day {day} assignment. "
+                        f"If this seems wrong, contact admin.",
+                    )
+            else:
+                await self._dm_user(
+                    change.requested_by,
+                    f"❌ Your request to be added to Day {day} ({to_lbl}) was declined.",
+                )
 
         elif action == "swap":
             a_id = details.get("user_a_id")

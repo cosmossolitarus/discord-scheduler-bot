@@ -264,8 +264,57 @@ SWAP = {
     },
 }
 
+REQUEST_NEW_SLOT = {
+    "name": "request_new_slot",
+    "description": (
+        "Use POST-LOCK when the user wants to be ADDED to a slot on a day they "
+        "do NOT currently have an assignment for. Examples: 'can I get a Day 1 "
+        "spot after reset', 'add me to Day 2 around 6pm', 'sign me up for Day 4 "
+        "Noble Advisor near 8pm'. Check the state's assignments — only call this "
+        "if they have no assignment for that day (or for Day 4, no assignment in "
+        "the track being requested). If they ALREADY have an assignment on that "
+        "day and want a different time, use move_slot instead. Requires admin "
+        "approval; if the target slot is taken, admin can choose to bump the "
+        "current assignee."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "day": {
+                "type": "integer",
+                "enum": [1, 2, 4],
+                "description": "Game day to be added to.",
+            },
+            "new_start_utc": {
+                "type": "string",
+                "description": (
+                    "Desired slot start time in HH:MM UTC. Pick a specific "
+                    "30-minute boundary (X:15 or X:45). If the user gave a "
+                    "range, pick the earliest valid time in that range."
+                ),
+            },
+            "track": {
+                "type": "string",
+                "enum": ["NA", "CM"],
+                "description": (
+                    "Required for Day 4 (which has both Noble Advisor 'NA' and "
+                    "Chief Minister 'CM' tracks). If the user mentions 'Noble "
+                    "Advisor' or 'NA', use NA; otherwise use CM. For Day 1 and "
+                    "Day 2 there is only one track (CM) — omit this field."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional short reason from the user.",
+            },
+        },
+        "required": ["day", "new_start_utc"],
+    },
+}
+
 LOCKED_TOOLS = [
-    MOVE_SLOT, DROP_SLOT, WIDEN_AVAILABILITY, SWAP, _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY,
+    MOVE_SLOT, DROP_SLOT, REQUEST_NEW_SLOT, WIDEN_AVAILABILITY, SWAP,
+    _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY,
 ]
 
 

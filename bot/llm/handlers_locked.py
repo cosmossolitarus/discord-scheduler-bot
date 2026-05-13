@@ -437,6 +437,133 @@ async def handle_swap(
     return None
 
 
+async def handle_request_new_slot(
+    action_input: dict,
+    state: dict,
+    message: discord.Message,
+    bot: "commands.Bot",
+) -> str | None:
+    """User wants to be added to a slot they don't currently have.
+
+    Creates a ChangeRequest (type=ADD) in PENDING_ADMIN. Admin reviews; if the
+    target slot is already taken, the approval body flags it and the apply
+    step (in changes.py) will bump the current assignee and DM them.
+    """
+    day = action_input.get("day")
+    new_start_utc = action_input.get("new_start_utc")
+    track = action_input.get("track")
+    reason = action_input.get("reason") or ""
+
+    if day not in (1, 2, 4) or not new_start_utc:
+        return f"request_new_slot: bad input day={day!r} new_start_utc={new_start_utc!r}"
+
+    # Track validation: required for Day 4, fixed to CM for Day 1/2
+    if day == 4:
+        if track not in ("NA", "CM"):
+            return (
+                "Day 4 has two tracks (Noble Advisor and Chief Minister). "
+                "Which one do you want?"
+            )
+    else:
+        track = "CM"  # only track on Day 1 and Day 2
+
+    # Check whether the user already has an assignment for that (day, track).
+    # For Day 4 we use (day, track) so an NA holder can still request CM and
+    # vice versa. For Day 1/2 (day) is enough since there's only CM.
+    if day == 4:
+        current = next(
+            (a for a in state["assignments"] if a["day"] == day and a.get("track") == track),
+            None,
+        )
+    else:
+        current = next((a for a in state["assignments"] if a["day"] == day), None)
+
+    if current is not None:
+        track_suffix = f" ({current.get('track_label', track)})" if day == 4 else ""
+        return (
+            f"You already have a Day {day}{track_suffix} assignment "
+            f"({current['start_utc']}-{current['end_utc']} UTC). "
+            f"Use 'move' to change it instead."
+        )
+
+    day1 = _parse_day1(state)
+    target_slot_id = find_slot_by_start(day1, day, new_start_utc, track=track)
+    if target_slot_id is None:
+        return (
+            f"No slot starts exactly at {new_start_utc} UTC on Day {day} "
+            f"(track {track}). Slots start every 30 minutes (e.g. 10:15, 10:45)."
+        )
+
+    async with async_session() as session:
+        event = await _fetch_event(session, day1)
+        if event is None:
+            return "request_new_slot: event not found"
+
+        target_slot = await _fetch_slot(session, target_slot_id)
+        if target_slot is None:
+            return "request_new_slot: slot lookup failed"
+
+        # Snapshot the slot's current occupant (if any) at request time. The
+        # _apply_change step re-checks at approval time and may see a different
+        # state — we use that re-check to decide who actually gets bumped.
+        occupied = await session.execute(
+            select(Assignment).where(
+                Assignment.event_id == event.event_id,
+                Assignment.slot_id == target_slot_id,
+            )
+        )
+        existing_assignment = occupied.scalar_one_or_none()
+
+        track_label = "Noble Advisor" if track == "NA" else "Chief Minister"
+        change = ChangeRequest(
+            event_id=event.event_id,
+            requested_by=message.author.id,
+            change_type=ChangeType.ADD,
+            status=ChangeStatus.PENDING_ADMIN,
+            details={
+                "action": "request_new_slot",
+                "day": day,
+                "track": track,
+                "to_slot_id": target_slot_id,
+                "reason": reason,
+            },
+            reason_for_user=reason or None,
+        )
+        session.add(change)
+        await session.flush()
+        change_id = change.change_id
+
+        body_lines = [
+            f"**Change #{change_id} — add slot**",
+            f"User: {message.author.display_name} ({message.author.mention})",
+            f"Day {day} ({track_label})",
+            f"Target: {_slot_time_label(target_slot)} on {target_slot.start_time.strftime('%Y-%m-%d')}",
+        ]
+        if existing_assignment is not None:
+            current_member = _find_member(bot, existing_assignment.discord_id)
+            current_name = current_member.display_name if current_member else f"user {existing_assignment.discord_id}"
+            body_lines.append(
+                f"**Heads up:** slot currently assigned to **{current_name}**. "
+                f"Approving will reassign and bump them."
+            )
+        if reason:
+            body_lines.append(f"Reason: {reason}")
+
+        msg_id = await _post_approval_message(bot, "\n".join(body_lines))
+        if msg_id is not None:
+            change.approval_message_id = msg_id
+
+        await session.commit()
+        bumped_for_log = existing_assignment.discord_id if existing_assignment else None
+        logger.info(
+            f"request_new_slot: change #{change_id} created "
+            f"(user={message.author.id} target={target_slot_id} "
+            f"current_assignee={bumped_for_log})"
+        )
+
+    return None
+
+
 async def handle_query(
     action_input: dict,
     state: dict,
@@ -489,6 +616,7 @@ async def handle_greet(
 LOCKED_HANDLERS = {
     "move_slot": handle_move_slot,
     "drop_slot": handle_drop_slot,
+    "request_new_slot": handle_request_new_slot,
     "widen_availability": handle_widen_availability,
     "swap": handle_swap,
     "query": handle_query,

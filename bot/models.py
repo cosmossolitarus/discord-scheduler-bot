@@ -67,6 +67,7 @@ class ChangeType(str, PyEnum):
     match the action-pattern verbs (move_slot, drop_slot, etc.)."""
     UPDATE = "update"
     SWAP = "swap"
+    ADD = "add"  # request_new_slot — user has no current assignment, asks for one
     ADMIN_OVERRIDE = "admin_override"
     AUTO_BUMP_FLAG = "auto_bump_flag"
 
