@@ -50,9 +50,28 @@ _BASE_SYSTEM_PROMPT = """You are a scheduling bot for a 28-day game cycle. \
 You manage 30-minute time slots on Day 1, Day 2, and Day 4 only. \
 Day 3 and Day 5 are NOT tracked.
 
+## RESPONSE FORMAT — MANDATORY
+
+EVERY reply you produce MUST include a text block. Without a text block the user receives nothing.
+
+Structure your reply as:
+  (1) A short text block in the user's language — what you're doing or asking. ALWAYS present.
+  (2) Optionally followed by one or more tool_use blocks for the actions you decided on.
+
+NEVER reply with only tool_use blocks. NEVER skip the text block "because the action is obvious." \
+Even for `out_of_scope`, `clarify`, and `query`, the text block IS the user-facing answer — \
+the tool_use is just a structured signal for the backend.
+
+Examples of valid replies:
+- Text: "Got it — marking you available on Day 1 from 2pm." + tool_use: set_availability(day=1, ...)
+- Text: "Day 3 isn't tracked by the scheduler. I only handle Day 1, 2, and 4." + tool_use: out_of_scope(reason="...")
+- Text: "Which day did you mean?" + tool_use: clarify(ambiguity="...")
+- Text: "Your current Day 2 slot is 19:00-19:30 UTC." + tool_use: query(subject="my times")
+
 ## YOUR JOB
-1. Decide what the user is asking for. Emit one or more tool_use blocks for the action(s).
-2. Write a short conversational reply IN THE USER'S LANGUAGE describing what you are doing or what you need clarified.
+
+1. ALWAYS produce a text block in the user's language (see above).
+2. Decide what the user is asking for and emit one or more tool_use blocks for the action(s).
 3. NEVER mention internal slot IDs (e.g. "D1-CM-21"). Always say times like "10:00 UTC".
 
 Multiple actions in one message are fine. Examples:
@@ -301,6 +320,66 @@ async def _translate_errors(
     return "🚨 " + "\n🚨 ".join(handler_errors)
 
 
+# ─── Fallback synthesis (when LLM forgets the text block) ───────
+
+
+def _synthesize_fallback(response_content) -> str:
+    """Build a fallback English reply from tool_use inputs alone.
+
+    Called when the LLM emitted tool_use blocks but no text block — the
+    user would otherwise see "(no reply)". We use the tool inputs to
+    construct something informative. Some inputs (out_of_scope.reason,
+    clarify.ambiguity) may have been written by the LLM in the user's
+    language; we use those directly when present. Other actions get
+    generic English templates.
+    """
+    parts: list[str] = []
+    for block in response_content:
+        if getattr(block, "type", None) != "tool_use":
+            continue
+        name = block.name
+        inp = block.input or {}
+
+        if name == "out_of_scope":
+            reason = (inp.get("reason") or "").strip()
+            parts.append(reason or "I can only help with Day 1, Day 2, or Day 4 scheduling.")
+        elif name == "clarify":
+            ambig = (inp.get("ambiguity") or "").strip()
+            parts.append(ambig or "Could you clarify your request?")
+        elif name == "query":
+            subj = inp.get("subject", "your question")
+            parts.append(
+                f"I received your question about {subj!r} but didn't generate a written answer. "
+                f"Try asking again with a bit more detail."
+            )
+        elif name == "set_availability":
+            day = inp.get("day")
+            n = len(inp.get("windows") or [])
+            if n == 0:
+                parts.append(f"Marked you as not available on Day {day}.")
+            else:
+                parts.append(f"Updated your Day {day} availability ({n} window(s)).")
+        elif name == "widen_availability":
+            day = inp.get("day")
+            parts.append(f"Added more availability on Day {day}.")
+        elif name == "move_slot":
+            day = inp.get("day")
+            new_time = inp.get("new_start_utc", "?")
+            parts.append(
+                f"Move request submitted: Day {day} → {new_time} UTC. Pending admin approval."
+            )
+        elif name == "drop_slot":
+            day = inp.get("day")
+            parts.append(f"Drop request submitted for Day {day}. Pending admin approval.")
+        elif name == "swap":
+            day = inp.get("day")
+            parts.append(
+                f"Swap request submitted for Day {day}. Waiting for the other player's confirmation."
+            )
+
+    return "\n".join(parts).strip()
+
+
 # ─── Public entry point ─────────────────────────────────────────
 
 
@@ -375,12 +454,14 @@ async def process_user_message(
 
     text_parts: list[str] = []
     handler_errors: list[str] = []
+    tool_names: list[str] = []  # for logging
 
     for block in response.content:
         btype = getattr(block, "type", None)
         if btype == "text":
             text_parts.append(block.text)
         elif btype == "tool_use":
+            tool_names.append(block.name)
             handler = handlers.get(block.name)
             if handler is None:
                 handler_errors.append(f"{block.name}: unknown action")
@@ -393,10 +474,26 @@ async def process_user_message(
                 logger.exception(f"Handler {block.name} crashed")
                 handler_errors.append(f"{block.name}: internal error")
 
+    logger.info(
+        f"LLM response: {len(text_parts)} text block(s), "
+        f"tool_uses={tool_names}, errors={len(handler_errors)}"
+    )
+
     main_reply = "\n".join(text_parts).strip()
 
+    # Fallback: the LLM emitted tool_use blocks but no text block. Synthesize
+    # a reasonable English reply from the tool inputs so the user always sees
+    # something. The system prompt asks for text but this is a defensive net.
+    if not main_reply and tool_names:
+        main_reply = _synthesize_fallback(response.content)
+        if main_reply:
+            logger.warning(
+                f"LLM omitted text block; used fallback synthesis. "
+                f"tool_uses={tool_names}"
+            )
+
     if not handler_errors:
-        return main_reply or "(no reply)"
+        return main_reply or "I processed your message but didn't generate a reply. Please try again."
 
     # Translate errors into the same language as the main reply
     translated_errors = await _translate_errors(text, main_reply, handler_errors)
