@@ -430,7 +430,7 @@ class Changes(commands.Cog):
                 continue
             try:
                 await log_channel.send(
-                    "🔄 Schedule updated after a change.",
+                    "**Schedule updated after a change.**",
                     file=discord.File(csv_file, filename=f"schedule_{day1.date()}.csv"),
                 )
             except discord.HTTPException as e:

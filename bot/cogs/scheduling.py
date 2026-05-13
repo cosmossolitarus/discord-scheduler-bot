@@ -206,7 +206,7 @@ class Scheduling(commands.Cog):
             log_channel = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
             if log_channel:
                 msg = await log_channel.send(
-                    f"📋 **Final schedule archive** — Event {day1.date()}",
+                    f"**Final schedule archive** — Event {day1.date()}",
                     file=discord.File(csv_file, filename=f"schedule_final_{day1.date()}.csv"),
                 )
                 try:

@@ -403,7 +403,7 @@ async def handle_swap(
             return "swap: couldn't find the other player in the guild."
 
         dm_body = (
-            f"🔁 **Swap request #{change_id}**\n\n"
+            f"**Swap request #{change_id}**\n\n"
             f"{message.author.display_name} wants to swap with you on Day {day}:\n"
             f"• You currently have {_slot_time_label(other_slot)} on "
             f"{other_slot.start_time.strftime('%Y-%m-%d')}\n"

@@ -71,7 +71,10 @@ class Submissions(commands.Cog):
             # Discord messages cap at 2000 chars. Truncate cleanly if needed.
             if len(reply) > 1900:
                 reply = reply[:1900] + "\n…(reply truncated)"
-            await message.reply(reply, mention_author=False)
+            # Ping the user only when there's a 🚨 in the reply — that means
+            # something is missing or went wrong and they need to act.
+            needs_ping = "🚨" in reply
+            await message.reply(reply, mention_author=needs_ping)
 
     # ─── Lifecycle hook: post the opening announcement ──────
 
