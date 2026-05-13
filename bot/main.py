@@ -28,7 +28,7 @@ from sqlalchemy import select
 
 from bot.config import GUILD_ID
 from bot.cycle import compute_active_cycle_day1, should_archive, should_lock
-from bot.database import async_session, init_db
+from bot.database import async_session, init_db, migrate_db
 from bot.events import create_event
 from bot.models import Event, EventPhase
 
@@ -123,6 +123,7 @@ async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     await init_db()
+    await migrate_db()
     logger.info("Database initialized")
 
     try:
