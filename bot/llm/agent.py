@@ -76,7 +76,9 @@ the absolute UTC time yourself for relative requests like "3 hours earlier".
 - `query`: user is asking about their current state (their times, Speedups, status, deadlines).
 - `greet`: user said hi/hello/test, asked for help, or sent an opener without a specific action.
 - `out_of_scope`: user is asking about Day 3 or Day 5, other players' data, trying to set \
-Speedups via text, or sending unrelated chatter.
+Speedups via TEXT (e.g., "I have 5 days of construction speedups"), or sending truly unrelated \
+chatter. Do NOT use this as a fallback for scheduling intents you don't have an exact tool for — \
+those have parses (see below).
 - `clarify`: user's request is ambiguous and you cannot reliably act on it.
 
 ## MULTI-DAY MESSAGES
@@ -101,13 +103,28 @@ STATE's availability summary to decide how to compose `windows`:
 - AMBIGUOUS ("Day 1 evenings" with prior Day 1 mornings on file) → treat as \
   REPLACEMENT. Latest message wins.
 
+## CLEARING A DAY
+
+These verbs ALWAYS mean "make me unavailable that day" pre-lock, and parse to \
+set_availability(day=X, windows=[]):
+  drop / remove / cancel / clear / scratch / "take me off" / "I can't make" / \
+  "not available" / "skip"
+
+Pre-lock the word "drop" NEVER refers to the post-lock `drop_slot` tool — that \
+tool does not exist pre-lock. "Drop my Day 1 time" = set_availability(day=1, windows=[]).
+
+## SIGNING UP WITHOUT A SPECIFIC TIME
+
+"Sign me up Day X" / "add me Day X" / "include me Day X" / "I'm in for Day X" / \
+"yes for Day X" with NO time mentioned → windows=[{start_utc:"00:00", end_utc:"23:59"}] \
+(treat as full day — it's a friendly default).
+
 ## TIME RULES
 
 - All times in tool_use inputs are UTC, HH:MM 24-hour format.
 - Convert local timezones the user mentions to UTC.
 - A window may cross midnight — emit end_utc earlier than start_utc, the backend handles it.
 - "Any day" / "anytime" / "all day" for Day X → windows=[{start_utc:"00:00", end_utc:"23:59"}].
-- "Not available Day X" / "skip Day X" → windows=[] (empty list).
 
 ## RESET SEMANTICS (strict)
 
@@ -295,12 +312,20 @@ def _render_swap(inp: dict, state: dict) -> str:
     )
 
 
-def _render_out_of_scope() -> str:
-    return (
-        "I can only help with scheduling for **Day 1**, **Day 2**, and **Day 4**. "
-        "Speedups have to come from a screenshot of your in-game Speedups page, "
-        "not text."
-    )
+def _render_out_of_scope(inp: dict) -> str:
+    """Generic out-of-scope reply. Optionally appends the LLM's reason in italics.
+
+    The previous template hardcoded "Speedups have to come from a screenshot,
+    not text", which read as a non-sequitur whenever the LLM reached for
+    out_of_scope for any other reason (Day 3 chatter, an unrecognized verb,
+    etc.). This version stays neutral and lets the LLM's `reason` field carry
+    context if it provided one.
+    """
+    reason = (inp.get("reason") or "").strip()
+    base = "I only handle availability and Speedups for **Day 1, Day 2, and Day 4**."
+    if reason:
+        return f"{base}\n_{reason}_"
+    return base
 
 
 def _render_clarify(inp: dict) -> str:
@@ -364,9 +389,6 @@ async def _completeness_status(
 
     if sub is None:
         if screenshot_attempted:
-            # Their screenshot didn't land; the error message already said so.
-            # Still no submission means no availability either, but they
-            # haven't tried that yet, so prompt.
             return (
                 "🚨 You also need to tell me your availability for Day 1, Day 2, "
                 "or Day 4 before I can add you to the schedule."
@@ -543,7 +565,7 @@ async def process_user_message(
                         if action_name == "greet":
                             action_lines.append(_render_greet(pre_state))
                         elif action_name == "out_of_scope":
-                            action_lines.append(_render_out_of_scope())
+                            action_lines.append(_render_out_of_scope(action_input))
                         else:  # clarify
                             action_lines.append(_render_clarify(action_input))
                 # other no-op actions: nothing to render

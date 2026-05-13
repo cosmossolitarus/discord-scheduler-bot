@@ -170,11 +170,24 @@ def summarize_availability(day1: datetime, slot_ids: list[str]) -> str:
             lines.append(f"Day {day}: not available")
             continue
 
+        # Day 4 has two tracks (NA and CM) at every time. For user-facing
+        # display, dedupe by (start_time, end_time) so the same window
+        # doesn't appear twice — once from each track.
+        seen_ranges: set[tuple[datetime, datetime]] = set()
+        unique: list[dict] = []
+        for s in day_slots:
+            key = (s["start_time"], s["end_time"])
+            if key in seen_ranges:
+                continue
+            seen_ranges.add(key)
+            unique.append(s)
+        unique.sort(key=lambda s: s["start_time"])
+
         # Group consecutive slots into windows
         windows: list[tuple[datetime, datetime]] = []
-        cur_start = day_slots[0]["start_time"]
-        cur_end = day_slots[0]["end_time"]
-        for s in day_slots[1:]:
+        cur_start = unique[0]["start_time"]
+        cur_end = unique[0]["end_time"]
+        for s in unique[1:]:
             if s["start_time"] == cur_end:
                 cur_end = s["end_time"]
             else:
