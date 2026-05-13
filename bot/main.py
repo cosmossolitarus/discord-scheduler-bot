@@ -128,12 +128,23 @@ async def on_ready():
 
     try:
         if GUILD_ID:
+            # Guild-scoped commands: instant sync, no global propagation wait.
+            # Cogs register commands as global (no @app_commands.guilds decorator),
+            # so we move them into the guild's set and explicitly empty the global
+            # set every boot. The double sync below is idempotent: pushing an empty
+            # global set is a no-op once Discord knows we have no global commands,
+            # but it cleans up any lingering global registrations from previous
+            # boots that synced both ways and caused command doubling.
             guild = discord.Object(id=int(GUILD_ID))
             bot.tree.copy_global_to(guild=guild)
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()  # push empty global set
             synced = await bot.tree.sync(guild=guild)
             logger.info(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
-        global_synced = await bot.tree.sync()
-        logger.info(f"Synced {len(global_synced)} slash command(s) globally")
+        else:
+            # No GUILD_ID — register globally. Takes up to ~1 hour to propagate.
+            synced = await bot.tree.sync()
+            logger.info(f"Synced {len(synced)} slash command(s) globally")
     except Exception as e:
         logger.error(f"Failed to sync slash commands: {e}")
 
