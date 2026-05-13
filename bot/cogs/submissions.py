@@ -219,8 +219,16 @@ class Submissions(commands.Cog):
                 if text_type == "availability":
                     slot_reference = generate_slot_times(day1)
                     day1_str = day1.strftime("%B %d, %Y")
+
+                    # Build context of existing availability so the LLM can
+                    # interpret partial updates without dropping prior days.
+                    existing_summary = self._build_existing_summary(
+                        submission.availability or [], slot_reference
+                    )
+
                     availability_result = await parse_availability(
-                        text_content, day1_str, slot_reference
+                        text_content, day1_str, slot_reference,
+                        existing_summary=existing_summary,
                     )
 
             # ── Build response ──
@@ -347,6 +355,53 @@ class Submissions(commands.Cog):
             await session.commit()
 
         await message.reply(f"{status} {body}")
+
+    @staticmethod
+    def _build_existing_summary(
+        slot_ids: list[str], slot_reference: list[dict]
+    ) -> str | None:
+        """Summarize an existing availability list in 'Day X: HH:MM - HH:MM UTC' form.
+
+        Used to give the availability LLM context for partial updates.
+        Returns None if no existing slots.
+        """
+        if not slot_ids:
+            return None
+
+        slot_map = {sd["slot_id"]: sd for sd in slot_reference}
+
+        by_day = {}
+        for sid in slot_ids:
+            sd = slot_map.get(sid)
+            if not sd:
+                continue
+            by_day.setdefault(sd["day"], []).append(sd)
+
+        if not by_day:
+            return None
+
+        lines = []
+        for day in sorted(by_day.keys()):
+            slots = sorted(by_day[day], key=lambda s: s["start_time"])
+            # Group into contiguous windows
+            windows = []
+            current = [slots[0]]
+            for sl in slots[1:]:
+                if sl["start_time"] == current[-1]["end_time"]:
+                    current.append(sl)
+                else:
+                    windows.append(current)
+                    current = [sl]
+            windows.append(current)
+
+            window_strs = []
+            for w in windows:
+                start = w[0]["start_time"].strftime("%H:%M")
+                end = w[-1]["end_time"].strftime("%H:%M")
+                window_strs.append(f"{start}-{end}")
+            lines.append(f"Day {day}: {', '.join(window_strs)} UTC")
+
+        return "\n".join(lines)
 
     # ─── Query Handler ───────────────────────────────────────────
 

@@ -58,7 +58,17 @@ So "before noon for construction" means "Day 1: before noon", NOT "all days for 
 Each resource phrase maps to exactly one day.
 
 If the user provides times for Day 3 or Day 5, IGNORE those days — only use times for
-Day 1, Day 2, and Day 4 when building the slot list.
+Day 1, Day 2, and Day 4 when building the slot list. Other Day 3/5 references like
+"troops on Day 3" (which mixes a Day 4 resource word with a Day 3 number) are ambiguous —
+do your best to extract whatever IS clear from the rest of the message and skip the
+ambiguous part. Do NOT return an error just because one part of the message is unclear.
+
+"I don't need X" / "skip Day X" / "not available Day X" means that day should map to NO
+slots (empty for that day). This is valid — return an empty list for that day but still
+process the other days normally.
+
+Process whatever you CAN extract. Even if only one day is clear, return slots for that
+day. Only return an error if NO day's availability can be determined at all.
 
 Your job: determine which slot IDs the user is available for.
 
@@ -91,6 +101,7 @@ async def parse_availability(
     text: str,
     day1_date_str: str,
     slot_reference: list[dict],
+    existing_summary: str | None = None,
 ) -> dict:
     """
     Parse free-text availability into a list of slot IDs.
@@ -99,6 +110,8 @@ async def parse_availability(
         text: User's free-text availability description.
         day1_date_str: Human-readable Day 1 date, e.g., "May 18, 2026".
         slot_reference: Output of generate_slot_times() for this event.
+        existing_summary: Optional summary of the user's existing availability
+            so the LLM can interpret partial updates correctly.
 
     Returns:
         Dict with keys:
@@ -108,6 +121,17 @@ async def parse_availability(
     """
     system = build_system_prompt(day1_date_str, slot_reference)
 
+    if existing_summary:
+        user_content = (
+            f"The user already has this availability on file:\n{existing_summary}\n\n"
+            f"Their new message is below. Interpret it as a PARTIAL update — only "
+            f"change the days they mention. For days they don't mention, return the "
+            f"slot IDs for their existing availability so they are preserved.\n\n"
+            f"User message:\n{text}"
+        )
+    else:
+        user_content = text
+
     try:
         response = await client.messages.create(
             model=ANTHROPIC_MODEL,
@@ -116,7 +140,7 @@ async def parse_availability(
             messages=[
                 {
                     "role": "user",
-                    "content": text,
+                    "content": user_content,
                 }
             ],
         )

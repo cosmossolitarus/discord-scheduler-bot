@@ -498,7 +498,34 @@ class Changes(commands.Cog):
         """
         slot_reference = generate_slot_times(day1)
         day1_str = day1.strftime("%B %d, %Y")
-        avail_result = await parse_availability(text, day1_str, slot_reference)
+
+        # Fetch the user's current availability so we can pass it to the LLM
+        async with async_session() as session:
+            event = await self._get_event(session, day1)
+            if event is None:
+                return
+
+            sub_result = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event.event_id,
+                    Submission.discord_id == message.author.id,
+                )
+            )
+            submission = sub_result.scalar_one_or_none()
+            if submission is None:
+                await message.reply("You don't have a submission for this event.")
+                return
+
+            old_availability = submission.availability or []
+
+        from bot.cogs.submissions import Submissions
+        existing_summary = Submissions._build_existing_summary(
+            old_availability, slot_reference
+        )
+
+        avail_result = await parse_availability(
+            text, day1_str, slot_reference, existing_summary=existing_summary,
+        )
 
         if "error" in avail_result:
             await message.reply(f"❌ {avail_result['error']}. Please try again.")
@@ -507,6 +534,7 @@ class Changes(commands.Cog):
         new_slots = avail_result["available_slots"]
 
         async with async_session() as session:
+            # Re-fetch event/submission in the new session for the write
             event = await self._get_event(session, day1)
             if event is None:
                 return
@@ -895,7 +923,12 @@ class Changes(commands.Cog):
             a1.discord_id, a2.discord_id = a2.discord_id, a1.discord_id
 
     async def _apply_update(self, session, change: ChangeRequest):
-        """Apply an availability or resource update."""
+        """Apply an availability or resource update.
+
+        For availability updates: also delete any existing Assignment rows
+        for the user whose slot is no longer in their availability. This is
+        what makes "drop my Day X" actually drop the assignment.
+        """
         details = change.details
         sub_result = await session.execute(
             select(Submission).where(
@@ -904,8 +937,39 @@ class Changes(commands.Cog):
             )
         )
         submission = sub_result.scalar_one_or_none()
-        if submission and "new_availability" in details:
-            submission.availability = details["new_availability"]
+        if not submission:
+            return
+
+        if "new_availability" in details:
+            new_avail = details["new_availability"]
+            submission.availability = new_avail
+            new_avail_set = set(new_avail or [])
+
+            # Remove assignments whose slot is no longer in the user's availability
+            assign_result = await session.execute(
+                select(Assignment).where(
+                    Assignment.event_id == change.event_id,
+                    Assignment.discord_id == change.requested_by,
+                )
+            )
+            assignments = list(assign_result.scalars().all())
+
+            removed_slots = []
+            for a in assignments:
+                if a.slot_id not in new_avail_set:
+                    removed_slots.append(a.slot_id)
+                    await session.delete(a)
+
+            if removed_slots:
+                session.add(AuditLog(
+                    event_id=change.event_id,
+                    action="Assignment removed via availability update",
+                    actor=str(change.requested_by),
+                    details={
+                        "change_id": change.change_id,
+                        "removed_slots": removed_slots,
+                    },
+                ))
 
     async def _apply_bump(self, session, change: ChangeRequest):
         """Apply an auto-bump: replace one user with another in a slot."""
