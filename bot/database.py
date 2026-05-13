@@ -65,14 +65,26 @@ async def init_db() -> None:
 
 
 async def migrate_db() -> None:
-    """Apply one-time column renames. Safe to run on every boot — skips
-    renames where the old column no longer exists."""
+    """Apply one-time column renames and enum-value additions. Safe to run on
+    every boot — skips renames where the old column no longer exists, and
+    enum value adds use IF NOT EXISTS so they're no-ops if already applied."""
     renames = [
         ("resource_x",       "speedup_construction"),
         ("resource_y",       "speedup_research"),
         ("resource_z",       "speedup_training"),
         ("resource_generic", "speedup_general"),
     ]
+
+    # Postgres enums don't get extended by Base.metadata.create_all — that only
+    # creates them fresh. Adding a new ChangeType / ChangeStatus / EventPhase
+    # member in models.py requires an explicit ALTER TYPE. List each one here
+    # the first time it's added so existing DBs pick it up on next boot.
+    # SQLAlchemy stores enum members by .name, so values listed below should
+    # match the Python member name (e.g. "ADD", not "add").
+    enum_additions = [
+        ("changetype", "ADD"),  # request_new_slot — added when post-lock new-slot requests were introduced
+    ]
+
     async with engine.begin() as conn:
         for old, new in renames:
             result = await conn.execute(
@@ -86,3 +98,12 @@ async def migrate_db() -> None:
                 await conn.execute(
                     text(f"ALTER TABLE submissions RENAME COLUMN {old} TO {new}")
                 )
+
+        for type_name, value in enum_additions:
+            # ALTER TYPE ... ADD VALUE IF NOT EXISTS requires PG 9.6+. Railway
+            # Postgres is modern enough. The IF NOT EXISTS avoids errors when
+            # the value is already present (e.g. fresh DB where create_all
+            # built the enum with the full set).
+            await conn.execute(
+                text(f"ALTER TYPE {type_name} ADD VALUE IF NOT EXISTS '{value}'")
+            )
