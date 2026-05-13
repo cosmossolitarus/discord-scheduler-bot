@@ -96,7 +96,7 @@ async def handle_set_availability(
             submission.has_availability = bool(merged)
             submission.discord_name = user_name  # keep fresh
 
-        # If we have resources too, recompute priorities (cheap, idempotent).
+        # If we have Speedups too, recompute priorities (cheap, idempotent).
         if submission.has_screenshot:
             submission.compute_priorities()
 

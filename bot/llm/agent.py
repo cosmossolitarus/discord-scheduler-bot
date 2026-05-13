@@ -10,7 +10,7 @@ Architecture:
 Response shape:
   - For state-changing actions in COLLECTING (set_availability, screenshot
     parsed) and for explicit `query`, a SINGLE merged state summary is
-    shown — availability across all three days + resources. The per-action
+    shown — availability across all three days + Speedups. The per-action
     lines from earlier versions are dropped in favor of this summary so
     multi-day messages produce one coherent confirmation, not a list.
   - Post-lock change requests (move/drop/swap) and `widen_availability`
@@ -73,10 +73,10 @@ the absolute UTC time yourself for relative requests like "3 hours earlier".
 - `drop_slot` (post-lock): user wants to give up an assignment.
 - `swap` (post-lock): user wants to trade slots with another player. Only call this if the user \
 @mentioned a player who appears in VALID SWAP PARTNERS in the state.
-- `query`: user is asking about their current state (their times, resources, status, deadlines).
+- `query`: user is asking about their current state (their times, Speedups, status, deadlines).
 - `greet`: user said hi/hello/test, asked for help, or sent an opener without a specific action.
 - `out_of_scope`: user is asking about Day 3 or Day 5, other players' data, trying to set \
-resources via text, or sending unrelated chatter.
+Speedups via text, or sending unrelated chatter.
 - `clarify`: user's request is ambiguous and you cannot reliably act on it.
 
 ## MULTI-DAY MESSAGES
@@ -189,10 +189,10 @@ async def _parse_and_save_screenshot(
             )
             session.add(submission)
 
-        submission.resource_x = parsed["resource_x"]
-        submission.resource_y = parsed["resource_y"]
-        submission.resource_z = parsed["resource_z"]
-        submission.resource_generic = parsed["resource_generic"]
+        submission.speedup_construction = parsed["speedup_construction"]
+        submission.speedup_research = parsed["speedup_research"]
+        submission.speedup_training = parsed["speedup_training"]
+        submission.speedup_general = parsed["speedup_general"]
         submission.has_screenshot = True
         submission.discord_name = user_name
         submission.compute_priorities()
@@ -205,7 +205,7 @@ async def _parse_and_save_screenshot(
 
 
 def _render_state_summary(state: dict, day1, include_assignments: bool = False) -> str:
-    """Multi-line block showing the user's current availability + resources.
+    """Multi-line block showing the user's current availability + Speedups.
 
     Used both as the response to `query` and as the auto-summary appended
     after any submission-touching action (set_availability, screenshot, or
@@ -224,17 +224,17 @@ def _render_state_summary(state: dict, day1, include_assignments: bool = False) 
 
     lines.append("")
 
-    # Resources section
-    if sub["resources"]:
-        r = sub["resources"]
+    # Speedups section
+    if sub["speedups"]:
+        r = sub["speedups"]
         lines.append(
-            f"Resources: construction {r['construction_days']:.2f}d, "
+            f"Speedups: construction {r['construction_days']:.2f}d, "
             f"research {r['research_days']:.2f}d, "
             f"troops {r['troops_days']:.2f}d, "
             f"general {r['general_days']:.2f}d (split into {r['generic_split']})"
         )
     else:
-        lines.append("Resources: not on file")
+        lines.append("Speedups: not on file")
 
     # Assignments (post-lock only)
     if include_assignments and state["phase"] == "locked":
@@ -298,7 +298,7 @@ def _render_swap(inp: dict, state: dict) -> str:
 def _render_out_of_scope() -> str:
     return (
         "I can only help with scheduling for **Day 1**, **Day 2**, and **Day 4**. "
-        "Resources have to come from a screenshot of your in-game Resources & Speedups page, "
+        "Speedups have to come from a screenshot of your in-game Speedups page, "
         "not text."
     )
 
@@ -319,7 +319,7 @@ def _render_greet(state: dict) -> str:
         "",
         "**To be added to the schedule, I need both:**",
         f"1. **Availability** — at least one time window on Day 1, 2, or 4{avail_tag}",
-        f"2. **Resources screenshot** — your in-game Resources & Speedups page{screen_tag}",
+        f"2. **Speedups screenshot** — your in-game Speedups page{screen_tag}",
         "",
         "**Examples:**",
         "  \"Day 1 from 2pm to 6pm EST\"",
@@ -337,11 +337,18 @@ async def _completeness_status(
     event: "Event",
     user_id: int,
     was_complete_before: bool,
+    screenshot_attempted: bool = False,
 ) -> str | None:
     """Return a single status line:
       - 🚨 reminder of what's missing, OR
       - ✅ "just became complete" affirmation (only on transition), OR
       - None when already complete / not applicable.
+
+    When `screenshot_attempted` is True, the user just tried to upload a
+    screenshot in this same message (which may have failed). In that case
+    we don't repeat "you still need a screenshot" — the parse-error line
+    already conveys that. We still warn about missing availability if it's
+    the only remaining gap.
     """
     if event.phase != EventPhase.COLLECTING:
         return None
@@ -356,8 +363,16 @@ async def _completeness_status(
         sub = result.scalar_one_or_none()
 
     if sub is None:
+        if screenshot_attempted:
+            # Their screenshot didn't land; the error message already said so.
+            # Still no submission means no availability either, but they
+            # haven't tried that yet, so prompt.
+            return (
+                "🚨 You also need to tell me your availability for Day 1, Day 2, "
+                "or Day 4 before I can add you to the schedule."
+            )
         return (
-            "🚨 You still need to send a screenshot of your **Resources & Speedups** page AND "
+            "🚨 You still need to send a screenshot of your **Speedups** page AND "
             "tell me your availability for Day 1, Day 2, or Day 4 before I can add you to the schedule."
         )
 
@@ -371,17 +386,25 @@ async def _completeness_status(
         return None
 
     if sub.has_availability and not sub.has_screenshot:
+        if screenshot_attempted:
+            return None  # error line already covers this
         return (
             "🚨 You still need to send a screenshot of your in-game "
-            "**Resources & Speedups** page — without it, I can't add you to the schedule."
+            "**Speedups** page — without it, I can't add you to the schedule."
         )
     if sub.has_screenshot and not sub.has_availability:
         return (
             "🚨 You still need to tell me your availability for Day 1, Day 2, or Day 4 — "
             "without it, I can't add you to the schedule."
         )
+    # Neither piece on file
+    if screenshot_attempted:
+        return (
+            "🚨 You also need to tell me your availability for Day 1, Day 2, "
+            "or Day 4 before I can add you to the schedule."
+        )
     return (
-        "🚨 You still need to send a screenshot of your **Resources & Speedups** page AND "
+        "🚨 You still need to send a screenshot of your **Speedups** page AND "
         "tell me your availability for Day 1, Day 2, or Day 4 before I can add you to the schedule."
     )
 
@@ -509,12 +532,20 @@ async def process_user_message(
                     action_lines.append(_render_drop_slot(action_input, pre_state))
                 elif action_name == "swap":
                     action_lines.append(_render_swap(action_input, pre_state))
-                elif action_name == "greet":
-                    action_lines.append(_render_greet(pre_state))
-                elif action_name == "out_of_scope":
-                    action_lines.append(_render_out_of_scope())
-                elif action_name == "clarify":
-                    action_lines.append(_render_clarify(action_input))
+                elif action_name in ("greet", "out_of_scope", "clarify"):
+                    # These three are "non-action" actions. If the user attached
+                    # an image, their text is almost certainly commentary on
+                    # the screenshot ("here are my speedups", "see attached")
+                    # and a help/refusal/clarification reply would be noise.
+                    # Suppress in that case; the screenshot result and state
+                    # summary already speak for themselves.
+                    if not image_attachments:
+                        if action_name == "greet":
+                            action_lines.append(_render_greet(pre_state))
+                        elif action_name == "out_of_scope":
+                            action_lines.append(_render_out_of_scope())
+                        else:  # clarify
+                            action_lines.append(_render_clarify(action_input))
                 # other no-op actions: nothing to render
 
             if action_lines:
@@ -527,8 +558,13 @@ async def process_user_message(
         include_assn = event.phase == EventPhase.LOCKED
         sections.append(_render_state_summary(post_state, event.day1_date, include_assn))
 
-    # 7. Completeness / just-became-complete (pre-lock only, single line)
-    status = await _completeness_status(event, message.author.id, was_complete_before)
+    # 7. Completeness / just-became-complete (pre-lock only, single line).
+    #    `screenshot_attempted` suppresses the "send a screenshot" half of the
+    #    warning when one was just uploaded — the parse-error line covers it.
+    screenshot_attempted = bool(image_attachments)
+    status = await _completeness_status(
+        event, message.author.id, was_complete_before, screenshot_attempted
+    )
     if status:
         sections.append(status)
 

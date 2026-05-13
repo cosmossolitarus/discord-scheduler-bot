@@ -13,7 +13,7 @@ Phase 1b changes:
     - Uses mark_locked / mark_archived from bot.events for phase transitions
       (sets locked_at / archived_at timestamps).
     - AssignmentStatus is gone; the row's existence carries the information.
-    - Boundary-slot DM gets the dual-resource notice on schedule release.
+    - Boundary-slot DM gets the dual-Speedup notice on schedule release.
 """
 
 import csv
@@ -51,8 +51,8 @@ logger = logging.getLogger("scheduler.scheduling")
 BOUNDARY_NOTICE = (
     "\n\n**Boundary slot.** The slot at 23:45-00:15 (your last Day 1 block) "
     "spans the Day 1 / Day 2 boundary. You'll be the only player in that "
-    "window — use Day 1 (construction) resources for the first 15 minutes "
-    "and Day 2 (research) resources for the last 15 minutes."
+    "window — use Day 1 (construction) Speedups for the first 15 minutes "
+    "and Day 2 (research) Speedups for the last 15 minutes."
 )
 
 

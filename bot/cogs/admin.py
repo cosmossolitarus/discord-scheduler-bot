@@ -302,10 +302,10 @@ class Admin(commands.Cog):
         )
         if submission.has_screenshot:
             lines.append(
-                f"Resources: x={submission.resource_x or 0:.0f}, "
-                f"y={submission.resource_y or 0:.0f}, "
-                f"z={submission.resource_z or 0:.0f}, "
-                f"generic={submission.resource_generic or 0:.0f}"
+                f"Speedups: construction={submission.speedup_construction or 0:.0f}, "
+                f"research={submission.speedup_research or 0:.0f}, "
+                f"training={submission.speedup_training or 0:.0f}, "
+                f"general={submission.speedup_general or 0:.0f}"
             )
             lines.append(
                 f"Priority: x={submission.priority_x or 0:.0f}, "

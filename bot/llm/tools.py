@@ -27,7 +27,7 @@ _QUERY = {
     "name": "query",
     "description": (
         "Use when the user is asking about their own current state — their "
-        "assignments, availability, resources, or how the bot works. The "
+        "assignments, availability, Speedups, or how the bot works. The "
         "actual response goes in the text portion of your reply; this tool "
         "is just a signal that you're answering a query, not making changes."
     ),
@@ -36,7 +36,7 @@ _QUERY = {
         "properties": {
             "subject": {
                 "type": "string",
-                "description": "Short label of what was asked (e.g. 'my times', 'my resources', 'how do I update').",
+                "description": "Short label of what was asked (e.g. 'my times', 'my Speedups', 'how do I update').",
             },
         },
         "required": ["subject"],
@@ -48,7 +48,7 @@ _OUT_OF_SCOPE = {
     "description": (
         "Use when the user is asking about something the bot doesn't handle: "
         "Day 3 or Day 5 scheduling, jokes, other players' data, requests to "
-        "set resources via text (those must come from a screenshot), or any "
+        "set Speedups via text (those must come from a screenshot), or any "
         "non-scheduling chatter."
     ),
     "input_schema": {

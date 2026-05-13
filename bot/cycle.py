@@ -100,8 +100,8 @@ def generate_slot_times(day1: datetime) -> list[dict]:
     Slot counts: 49 + 48 + 49 + 49 = 195 total.
       Day 1 CM: 49 slots. The last one (D1-CM-49, 23:45 Day 1 - 00:15 Day 2)
                 is the BOUNDARY slot. The assignee uses Day 1 (construction)
-                resources for the first 15 minutes and Day 2 (research)
-                resources for the last 15 minutes.
+                Speedups for the first 15 minutes and Day 2 (research)
+                Speedups for the last 15 minutes.
       Day 2 CM: 48 slots starting at 00:15 Day 2 (no first slot — the boundary
                 slot above covers the Day 2 start in-game).
       Day 4 NA: 49 slots starting at 23:45 Day 3. Priority track.
@@ -154,10 +154,10 @@ def generate_slot_times(day1: datetime) -> list[dict]:
 
 
 def is_boundary_slot(slot_id: str) -> bool:
-    """True if this is the dual-resource boundary slot (D1-CM-49).
+    """True if this is the dual-Speedup boundary slot (D1-CM-49).
 
     The assignee gets a special notice on top of the normal schedule release
-    DM and reminder, explaining that they use Day 1 (construction) resources
-    for 23:45-00:00 Day 2 and Day 2 (research) resources for 00:00-00:15.
+    DM and reminder, explaining that they use Day 1 (construction) Speedups
+    for 23:45-00:00 Day 2 and Day 2 (research) Speedups for 00:00-00:15.
     """
     return slot_id == "D1-CM-49"

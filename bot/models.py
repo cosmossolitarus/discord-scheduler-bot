@@ -124,14 +124,14 @@ class Submission(Base):
     discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     discord_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    # Raw resource numbers from the screenshot (x = construction, y = research,
+    # Raw Speedup numbers from the screenshot (x = construction, y = research,
     # z = troops, generic = wildcard split across the three at GENERIC_SPLIT).
-    resource_x: Mapped[float | None] = mapped_column(Float, nullable=True)
-    resource_y: Mapped[float | None] = mapped_column(Float, nullable=True)
-    resource_z: Mapped[float | None] = mapped_column(Float, nullable=True)
-    resource_generic: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speedup_construction: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speedup_research: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speedup_training: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speedup_general: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # Resource value + share of generic, used by the optimizer.
+    # Speedup value + share of generic, used by the optimizer.
     priority_x: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority_y: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority_z: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -166,11 +166,11 @@ class Submission(Base):
         return self.has_screenshot and self.has_availability
 
     def compute_priorities(self, generic_split: int = 3) -> None:
-        """Distribute the generic resource pool across x/y/z."""
-        generic_share = (self.resource_generic or 0) / generic_split
-        self.priority_x = (self.resource_x or 0) + generic_share
-        self.priority_y = (self.resource_y or 0) + generic_share
-        self.priority_z = (self.resource_z or 0) + generic_share
+        """Distribute the generic Speedup pool across x/y/z."""
+        generic_share = (self.speedup_general or 0) / generic_split
+        self.priority_x = (self.speedup_construction or 0) + generic_share
+        self.priority_y = (self.speedup_research or 0) + generic_share
+        self.priority_z = (self.speedup_training or 0) + generic_share
 
 
 class Slot(Base):

@@ -99,7 +99,7 @@ class Submissions(commands.Cog):
                 f"{mention} — Submissions are open!{test_tag}\n\n"
                 f"**Day 1: {day1_str}**\n\n"
                 f"@mention me here with:\n"
-                f"• A screenshot of your in-game **Resources & Speedups** page\n"
+                f"• A screenshot of your in-game **Speedups** page\n"
                 f"• Your available times for **Day 1, Day 2, and Day 4** "
                 f"(in your local timezone or UTC — I'll convert)\n\n"
                 f"You can update either at any time before the lock. "

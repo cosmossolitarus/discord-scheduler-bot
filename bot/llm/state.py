@@ -4,7 +4,7 @@ State envelope construction.
 Given an inbound message + event + DB session, builds the structured state
 the LLM needs to make decisions. The envelope contains:
 
-  - the user's submission status (screenshot, availability summary, resources)
+  - the user's submission status (screenshot, availability summary, Speedups)
   - their current assignments (post-lock only)
   - the list of @mentioned discord IDs that are valid swap partners (post-lock)
   - basic event info (day1 date, phase)
@@ -52,15 +52,15 @@ async def build_state_envelope(
     submission_dict: dict = {
         "has_screenshot": bool(submission and submission.has_screenshot),
         "has_availability": bool(submission and submission.has_availability),
-        "resources": None,
+        "speedups": None,
         "availability_summary": None,
     }
     if submission and submission.has_screenshot:
-        submission_dict["resources"] = {
-            "construction_days": submission.resource_x or 0,
-            "research_days": submission.resource_y or 0,
-            "troops_days": submission.resource_z or 0,
-            "general_days": submission.resource_generic or 0,
+        submission_dict["speedups"] = {
+            "construction_days": submission.speedup_construction or 0,
+            "research_days": submission.speedup_research or 0,
+            "troops_days": submission.speedup_training or 0,
+            "general_days": submission.speedup_general or 0,
             "generic_split": GENERIC_SPLIT,
         }
     if submission and submission.has_availability:
@@ -155,10 +155,10 @@ def render_state_for_prompt(state: dict) -> str:
     parts.append("SUBMISSION:")
     parts.append(f"  Screenshot on file: {'yes' if sub['has_screenshot'] else 'no'}")
     parts.append(f"  Availability on file: {'yes' if sub['has_availability'] else 'no'}")
-    if sub["resources"]:
-        r = sub["resources"]
+    if sub["speedups"]:
+        r = sub["speedups"]
         parts.append(
-            f"  Resources (in days): construction={r['construction_days']:.2f}, "
+            f"  Speedups (in days): construction={r['construction_days']:.2f}, "
             f"research={r['research_days']:.2f}, troops={r['troops_days']:.2f}, "
             f"general={r['general_days']:.2f} (general is split by {r['generic_split']})"
         )
@@ -175,7 +175,7 @@ def render_state_for_prompt(state: dict) -> str:
         else:
             for a in state["assignments"]:
                 label = f"Day {a['day']} ({a['track_label']})"
-                boundary = " [BOUNDARY SLOT: 1st 15 min uses Day 1 resources, last 15 min uses Day 2 resources]" if a["is_boundary"] else ""
+                boundary = " [BOUNDARY SLOT: 1st 15 min uses Day 1 Speedups, last 15 min uses Day 2 Speedups]" if a["is_boundary"] else ""
                 parts.append(
                     f"  {label}: {a['start_utc']}-{a['end_utc']} UTC on {a['date']}{boundary}"
                 )

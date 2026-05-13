@@ -155,8 +155,8 @@ class Reminders(commands.Cog):
                 message += (
                     "\n\n**Boundary slot reminder.** Your 30-minute block "
                     "spans the Day 1 / Day 2 boundary. Use Day 1 "
-                    "(construction) resources for the first 15 minutes "
-                    "(23:45-00:00 UTC) and Day 2 (research) resources for "
+                    "(construction) Speedups for the first 15 minutes "
+                    "(23:45-00:00 UTC) and Day 2 (research) Speedups for "
                     "the last 15 minutes (00:00-00:15 UTC)."
                 )
 
