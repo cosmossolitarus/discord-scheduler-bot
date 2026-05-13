@@ -473,12 +473,26 @@ async def handle_clarify(
     return None
 
 
+async def handle_greet(
+    action_input: dict,
+    state: dict,
+    message: discord.Message,
+    bot: "commands.Bot",
+) -> str | None:
+    """No-op signal — agent renders the help template."""
+    logger.info(
+        f"greet: user={state['user']['discord_id']} kind={action_input.get('kind')!r}"
+    )
+    return None
+
+
 LOCKED_HANDLERS = {
     "move_slot": handle_move_slot,
     "drop_slot": handle_drop_slot,
     "widen_availability": handle_widen_availability,
     "swap": handle_swap,
     "query": handle_query,
+    "greet": handle_greet,
     "out_of_scope": handle_out_of_scope,
     "clarify": handle_clarify,
 }

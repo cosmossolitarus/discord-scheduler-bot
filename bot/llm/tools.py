@@ -82,6 +82,26 @@ _CLARIFY = {
     },
 }
 
+_GREET = {
+    "name": "greet",
+    "description": (
+        "Use when the user sent a greeting ('hi', 'hello', 'test'), asked "
+        "for help, or sent an opener without a specific scheduling request. "
+        "The backend will respond with a standardized help message."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["greeting", "help_request", "unclear_opener"],
+                "description": "'greeting' for hi/hello/test, 'help_request' for explicit asks for help, 'unclear_opener' for chatter that isn't a real action.",
+            },
+        },
+        "required": ["kind"],
+    },
+}
+
 _WINDOWS_ARRAY = {
     "type": "array",
     "description": (
@@ -131,7 +151,7 @@ SET_AVAILABILITY = {
     },
 }
 
-COLLECTING_TOOLS = [SET_AVAILABILITY, _QUERY, _OUT_OF_SCOPE, _CLARIFY]
+COLLECTING_TOOLS = [SET_AVAILABILITY, _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY]
 
 
 # ─── Post-lock toolset ───────────────────────────────────────────
@@ -245,7 +265,7 @@ SWAP = {
 }
 
 LOCKED_TOOLS = [
-    MOVE_SLOT, DROP_SLOT, WIDEN_AVAILABILITY, SWAP, _QUERY, _OUT_OF_SCOPE, _CLARIFY,
+    MOVE_SLOT, DROP_SLOT, WIDEN_AVAILABILITY, SWAP, _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY,
 ]
 
 

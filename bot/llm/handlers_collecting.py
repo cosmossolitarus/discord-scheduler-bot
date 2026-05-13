@@ -144,10 +144,24 @@ async def handle_clarify(
     return None
 
 
+async def handle_greet(
+    action_input: dict,
+    state: dict,
+    message: "discord.Message",
+    bot: "commands.Bot",
+) -> str | None:
+    """No-op signal — agent renders the help template."""
+    logger.info(
+        f"greet: user={state['user']['discord_id']} kind={action_input.get('kind')!r}"
+    )
+    return None
+
+
 # Map action names to handler functions. The agent uses this for dispatch.
 COLLECTING_HANDLERS = {
     "set_availability": handle_set_availability,
     "query": handle_query,
+    "greet": handle_greet,
     "out_of_scope": handle_out_of_scope,
     "clarify": handle_clarify,
 }
