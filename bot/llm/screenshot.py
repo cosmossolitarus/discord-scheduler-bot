@@ -6,7 +6,6 @@ extracts speedup durations, converts to days, and returns them.
 """
 
 import base64
-import json
 import logging
 
 import anthropic

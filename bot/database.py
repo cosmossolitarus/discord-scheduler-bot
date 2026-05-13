@@ -1,39 +1,42 @@
 """
-Database setup using async SQLAlchemy.
+Database setup. PostgreSQL only (via Railway's DATABASE_URL).
 
-Uses PostgreSQL in production (via DATABASE_URL env var from Railway)
-or SQLite locally as a fallback.
+There is no local SQLite fallback. Even local development requires a
+Postgres connection string — point DATABASE_URL at a local Postgres
+container if you need to test without Railway.
 """
 
 import os
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase
 
 
-def get_database_url() -> str:
-    """
-    Build the async database URL.
-
-    Railway sets DATABASE_URL as: postgresql://user:pass@host:port/dbname
-    SQLAlchemy async needs:       postgresql+asyncpg://user:pass@host:port/dbname
-
-    Falls back to local SQLite if DATABASE_URL is not set.
-    """
+def _resolve_database_url() -> str:
+    """Read DATABASE_URL and convert it to the async form SQLAlchemy needs."""
     url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. This bot requires PostgreSQL. "
+            "On Railway, attaching a Postgres service sets this automatically; "
+            "locally, point it at a Postgres instance you control."
+        )
 
-    if url is None:
-        return "sqlite+aiosqlite:///scheduler.db"
-
+    # Railway hands out 'postgresql://' (sometimes 'postgres://'); asyncpg needs
+    # 'postgresql+asyncpg://'.
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = "postgresql+asyncpg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://") and "+asyncpg" not in url:
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
 
     return url
 
 
-DATABASE_URL = get_database_url()
+DATABASE_URL = _resolve_database_url()
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -43,13 +46,18 @@ class Base(DeclarativeBase):
     pass
 
 
-async def init_db():
-    """Create all tables if they don't exist."""
-    from bot.models import Event, Submission, Slot, Assignment, ChangeRequest, AuditLog  # noqa
+async def init_db() -> None:
+    """Create all tables if they don't exist. Idempotent."""
+    # Importing models here avoids a circular import at module-load time.
+    from bot.models import (  # noqa: F401
+        Event,
+        Submission,
+        Slot,
+        Assignment,
+        ChangeRequest,
+        AuditLog,
+        SentReminder,
+    )
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-
-async def get_session() -> AsyncSession:
-    async with async_session() as session:
-        yield session

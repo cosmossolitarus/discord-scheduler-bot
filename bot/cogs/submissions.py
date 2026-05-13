@@ -1,31 +1,24 @@
 """
 Submissions cog.
 
-Handles:
-    - Opening submissions (pinging @player in #scheduling)
-    - Processing user @mentions with screenshots and/or availability text
-    - Echoing parsed data back for confirmation
-    - Storing submissions in the database
-    - Prompting for missing info (screenshot or availability)
+Handles user @mentions in #scheduling and dispatches to the action-pattern
+agent. The agent itself picks the right tool set based on the event's
+phase — this cog just routes.
+
+Also exposes announce_event_opened(event), which main.py and the admin
+/schedule test command call when a new event is created.
 """
 
 import logging
-from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
 from sqlalchemy import select
 
-from bot.config import PLAYER_ROLE, SCHEDULING_CHANNEL, SCHEDULE_LOG_CHANNEL, GENERIC_SPLIT
+from bot.config import PLAYER_ROLE, SCHEDULING_CHANNEL
 from bot.database import async_session
-from bot.models import Event, Submission, Slot, EventPhase, AuditLog
-from bot.cycle import (
-    get_current_phase, get_current_cycle_day1, get_cycle_dates,
-    generate_slot_times, Phase,
-)
-from bot.llm.screenshot import parse_screenshot
-from bot.llm.availability import parse_availability
-from bot.llm.utils import classify_message, off_day_reply, BASIC_PROMPT_REPLY, RESOURCE_CHANGE_REPLY
+from bot.llm.agent import process_user_message
+from bot.models import Event, EventPhase
 
 logger = logging.getLogger("scheduler.submissions")
 
@@ -34,404 +27,81 @@ class Submissions(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    async def open_submissions(self, day1: datetime):
-        """
-        Open submissions for an event. Called by the lifecycle loop.
-        Idempotent — checks if event already exists.
-        """
-        async with async_session() as session:
-            result = await session.execute(
-                select(Event).where(Event.day1_date == day1)
-            )
-            event = result.scalar_one_or_none()
-            if event is not None:
-                return  # Already created
-
-            event = Event(day1_date=day1, phase=EventPhase.COLLECTING)
-            session.add(event)
-            await session.flush()
-
-            slot_defs = generate_slot_times(day1)
-            for sd in slot_defs:
-                slot = Slot(
-                    slot_id=sd["slot_id"],
-                    event_id=event.event_id,
-                    day=sd["day"],
-                    track=sd["track"],
-                    slot_index=sd["slot_index"],
-                    start_time=sd["start_time"],
-                    end_time=sd["end_time"],
-                )
-                session.add(slot)
-
-            session.add(AuditLog(
-                event_id=event.event_id,
-                action="Submissions opened",
-                actor="system",
-                details={"day1": day1.isoformat()},
-            ))
-
-            await session.commit()
-            logger.info(f"Event created for Day 1 = {day1.date()}")
-
-        for guild in self.bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=SCHEDULING_CHANNEL)
-            role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
-            if channel and role:
-                day1_str = day1.strftime("%A, %B %d, %Y")
-                lock_date = get_cycle_dates(day1)["lock"]
-                lock_str = lock_date.strftime("%A, %B %d at %H:%M UTC")
-                await channel.send(
-                    f"{role.mention} — Scheduling is open for the event starting "
-                    f"**{day1_str}**!\n\n"
-                    f"To submit, @mention me in this channel with:\n"
-                    f"1. A screenshot of your resources\n"
-                    f"2. Your available times for each day (in UTC)\n\n"
-                    f"You can send both together or separately. "
-                    f"Example: \"@scheduler Day 1 anytime after 14:00, "
-                    f"Day 2 10:00-18:00, Day 4 all day\"\n\n"
-                    f"Submissions close automatically on **{lock_str}**."
-                )
-
-    # ─── Message Router ──────────────────────────────────────────
+    # ─── on_message: handle @mentions in #scheduling ─────────
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Process messages that @mention the bot."""
         if message.author.bot:
             return
-        if self.bot.user not in message.mentions:
+        if message.guild is None:
+            return  # DMs handled by Changes cog's reaction listener
+        if getattr(message.channel, "name", None) != SCHEDULING_CHANNEL:
             return
-        if message.channel.name != SCHEDULING_CHANNEL:
+        if self.bot.user is None or not self.bot.user.mentioned_in(message):
             return
 
-        phase, day1 = get_current_phase()
-
-        # Check DB phase too — handles force_lock ahead of calendar
-        db_phase = None
         async with async_session() as session:
             result = await session.execute(
-                select(Event).where(Event.day1_date == day1)
+                select(Event)
+                .where(Event.phase != EventPhase.ARCHIVED)
+                .order_by(Event.day1_date.desc())
             )
-            event = result.scalar_one_or_none()
-            if event is not None:
-                db_phase = event.phase
+            event = result.scalars().first()
 
-        if phase == Phase.IDLE and db_phase is None:
+        if event is None:
             await message.reply(
-                "There's no active scheduling period right now. "
-                "I'll ping everyone when the next one opens."
+                "There's no active event right now. I'll announce in this channel "
+                "when submissions open."
             )
             return
 
-        effective_locked = (
-            db_phase in (EventPhase.LOCKED, EventPhase.ACTIVE)
-            or phase in (Phase.LOCKED, Phase.ACTIVE)
-        )
-
-        if effective_locked:
-            changes_cog = self.bot.get_cog("Changes")
-            if changes_cog:
-                await changes_cog.handle_change_request(message, day1)
+        if event.phase not in (EventPhase.COLLECTING, EventPhase.LOCKED):
+            # ARCHIVED already filtered above; this shouldn't fire, but guard.
+            logger.warning(f"Unexpected event phase {event.phase} for live message handling")
             return
 
-        await self._process_submission(message, day1)
+        async with message.channel.typing():
+            try:
+                reply = await process_user_message(message, event, self.bot)
+            except Exception:
+                logger.exception("agent.process_user_message crashed")
+                reply = "🚨 Sorry, something went wrong handling your message. Please try again."
 
-    # ─── Submission Processing ───────────────────────────────────
+        if reply:
+            # Discord messages cap at 2000 chars. Truncate cleanly if needed.
+            if len(reply) > 1900:
+                reply = reply[:1900] + "\n…(reply truncated)"
+            await message.reply(reply, mention_author=False)
 
-    async def _process_submission(self, message: discord.Message, day1: datetime):
-        """Process a submission during the collecting phase."""
-        async with async_session() as session:
-            # Get or create event
-            result = await session.execute(
-                select(Event).where(Event.day1_date == day1)
-            )
-            event = result.scalar_one_or_none()
-            if event is None:
-                await message.reply("Something went wrong — no event found. Please contact an admin.")
-                return
+    # ─── Lifecycle hook: post the opening announcement ──────
 
-            # Get or create submission
-            result = await session.execute(
-                select(Submission).where(
-                    Submission.event_id == event.event_id,
-                    Submission.discord_id == message.author.id,
-                )
-            )
-            submission = result.scalar_one_or_none()
+    async def announce_event_opened(self, event: Event):
+        """Post the 'submissions are open' announcement in #scheduling.
 
-            if submission is None:
-                submission = Submission(
-                    event_id=event.event_id,
-                    discord_id=message.author.id,
-                    discord_name=message.author.display_name,
-                )
-                session.add(submission)
-                await session.flush()
-
-            # ── Process screenshot (if attached) ──
-
-            screenshot_result = None
-            if message.attachments:
-                for attachment in message.attachments:
-                    if attachment.content_type and attachment.content_type.startswith("image/"):
-                        image_data = await attachment.read()
-                        screenshot_result = await parse_screenshot(
-                            image_data, attachment.content_type
-                        )
-                        break
-
-            # ── Extract and classify text ──
-
-            text_content = message.content
-            for mention in message.mentions:
-                text_content = text_content.replace(
-                    f"<@{mention.id}>", ""
-                ).replace(
-                    f"<@!{mention.id}>", ""
-                )
-            text_content = text_content.strip()
-
-            availability_result = None
-            text_type = None
-
-            if text_content:
-                triage = await classify_message(text_content)
-                text_type = triage.get("type")
-
-                if text_type == "query" and screenshot_result is None:
-                    await self._handle_query(message, submission)
-                    return
-
-                if text_type == "resource_change" and screenshot_result is None:
-                    await message.reply(RESOURCE_CHANGE_REPLY)
-                    return
-
-                if text_type == "off_day" and screenshot_result is None:
-                    await message.reply(off_day_reply(triage.get("days", [])))
-                    return
-
-                if text_type == "other" and screenshot_result is None:
-                    await message.reply(BASIC_PROMPT_REPLY)
-                    return
-
-                # "availability" — or any type when a screenshot is also attached
-                if text_type == "availability":
-                    slot_reference = generate_slot_times(day1)
-                    day1_str = day1.strftime("%B %d, %Y")
-
-                    # Build context of existing availability so the LLM can
-                    # interpret partial updates without dropping prior days.
-                    existing_summary = self._build_existing_summary(
-                        submission.availability or [], slot_reference
-                    )
-
-                    availability_result = await parse_availability(
-                        text_content, day1_str, slot_reference,
-                        existing_summary=existing_summary,
-                    )
-
-            # ── Build response ──
-
-            response_lines = []
-            screenshot_ok = False
-            availability_ok = False
-
-            # Screenshot results
-            if screenshot_result is not None:
-                if "error" in screenshot_result:
-                    response_lines.append(
-                        f"**Screenshot:** {screenshot_result['error']}\n"
-                        f"Please try again with a clearer screenshot."
-                    )
-                else:
-                    submission.resource_x = screenshot_result["resource_x"]
-                    submission.resource_y = screenshot_result["resource_y"]
-                    submission.resource_z = screenshot_result["resource_z"]
-                    submission.resource_generic = screenshot_result["resource_generic"]
-                    submission.compute_priorities(GENERIC_SPLIT)
-                    submission.has_screenshot = True
-                    submission.screenshot_url = message.attachments[0].url
-                    response_lines.append(
-                        f"**Speedups:** General {submission.resource_generic:.1f}d · "
-                        f"Construction {submission.resource_x:.1f}d · "
-                        f"Research {submission.resource_y:.1f}d · "
-                        f"Troops {submission.resource_z:.1f}d"
-                    )
-                    screenshot_ok = True
-
-            # Availability results
-            if availability_result is not None:
-                if "error" in availability_result:
-                    response_lines.append(
-                        f"**Availability:** {availability_result['error']}\n"
-                        f"Please try again — describe your available times for "
-                        f"Day 1, Day 2, and/or Day 4."
-                    )
-                else:
-                    new_slots = availability_result["available_slots"]
-
-                    # Safety: if parser returned no slots, don't wipe existing data
-                    if not new_slots:
-                        response_lines.append(
-                            f"**Availability:** I couldn't extract any specific times from that. "
-                            f"Please describe your available times for Day 1, Day 2, and/or Day 4 "
-                            f"(e.g., \"Day 1 after 14 UTC, Day 2 anytime\")."
-                        )
-                    else:
-                        # Merge: keep existing slots for days not mentioned
-                        existing_slots = submission.availability or []
-                        if existing_slots:
-                            new_days = {sid.split("-")[0] for sid in new_slots}
-                            old_days = {sid.split("-")[0] for sid in existing_slots}
-                            unmentioned_days = old_days - new_days
-                            if unmentioned_days:
-                                kept = [
-                                    sid for sid in existing_slots
-                                    if sid.split("-")[0] in unmentioned_days
-                                ]
-                                new_slots = sorted(set(kept + new_slots))
-
-                        submission.availability = new_slots
-                        submission.has_availability = True
-                        submission.raw_availability_text = text_content
-                        summary = availability_result.get("player_summary", "")
-                        response_lines.append(f"**Availability:**\n{summary}")
-                        availability_ok = True
-
-            # Nothing processed
-            if not response_lines:
-                await message.reply(
-                    "I didn't find a screenshot or availability info in your message. "
-                    "Please send a screenshot of your resources and/or describe your "
-                    "available times."
-                )
-                return
-
-            # ── Status indicator + missing info ──
-
-            has_error = (
-                (screenshot_result is not None and not screenshot_ok)
-                or (availability_result is not None and not availability_ok)
-            )
-
-            missing = []
-            if not submission.has_screenshot:
-                missing.append("a **screenshot** of your resources")
-            if not submission.has_availability:
-                missing.append("your **available times** for each day")
-
-            if has_error:
-                status = "❌"
-            elif missing:
-                status = "🚨"
-            else:
-                status = "✅"
-
-            body = "\n".join(response_lines)
-
-            if missing:
-                body += (
-                    f"\n\n🚨 **YOUR SUBMISSION IS INCOMPLETE** 🚨\n"
-                    f"I still need {' and '.join(missing)}.\n"
-                    f"**Please @mention me again with the missing info or you won't be scheduled.**"
-                )
-            elif not has_error:
-                body += "\n\nSubmission complete — to update anything, just @mention me again."
-
-            submission.updated_at = datetime.now(timezone.utc)
-
-            session.add(AuditLog(
-                event_id=event.event_id,
-                action="Submission updated",
-                actor=str(message.author.id),
-                details={
-                    "has_screenshot": submission.has_screenshot,
-                    "has_availability": submission.has_availability,
-                    "is_complete": submission.is_complete,
-                },
-            ))
-
-            await session.commit()
-
-        await message.reply(f"{status} {body}")
-
-    @staticmethod
-    def _build_existing_summary(
-        slot_ids: list[str], slot_reference: list[dict]
-    ) -> str | None:
-        """Summarize an existing availability list in 'Day X: HH:MM - HH:MM UTC' form.
-
-        Used to give the availability LLM context for partial updates.
-        Returns None if no existing slots.
+        Called by main.py's lifecycle loop after creating an event, and by
+        /schedule test after creating a test event.
         """
-        if not slot_ids:
-            return None
-
-        slot_map = {sd["slot_id"]: sd for sd in slot_reference}
-
-        by_day = {}
-        for sid in slot_ids:
-            sd = slot_map.get(sid)
-            if not sd:
+        day1 = event.day1_date
+        for guild in self.bot.guilds:
+            channel = discord.utils.get(guild.text_channels, name=SCHEDULING_CHANNEL)
+            player_role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
+            if channel is None:
                 continue
-            by_day.setdefault(sd["day"], []).append(sd)
 
-        if not by_day:
-            return None
+            day1_str = day1.strftime("%A, %B %d, %Y")
+            test_tag = " — **TEST EVENT** (manual control only)" if event.is_test else ""
 
-        lines = []
-        for day in sorted(by_day.keys()):
-            slots = sorted(by_day[day], key=lambda s: s["start_time"])
-            # Group into contiguous windows
-            windows = []
-            current = [slots[0]]
-            for sl in slots[1:]:
-                if sl["start_time"] == current[-1]["end_time"]:
-                    current.append(sl)
-                else:
-                    windows.append(current)
-                    current = [sl]
-            windows.append(current)
-
-            window_strs = []
-            for w in windows:
-                start = w[0]["start_time"].strftime("%H:%M")
-                end = w[-1]["end_time"].strftime("%H:%M")
-                window_strs.append(f"{start}-{end}")
-            lines.append(f"Day {day}: {', '.join(window_strs)} UTC")
-
-        return "\n".join(lines)
-
-    # ─── Query Handler ───────────────────────────────────────────
-
-    async def _handle_query(self, message: discord.Message, submission: Submission):
-        """Show the user their current submission data."""
-        lines = []
-
-        if submission.has_screenshot:
-            lines.append(
-                f"**Speedups:** General {submission.resource_generic:.1f}d · "
-                f"Construction {submission.resource_x:.1f}d · "
-                f"Research {submission.resource_y:.1f}d · "
-                f"Troops {submission.resource_z:.1f}d"
+            mention = player_role.mention if player_role else ""
+            await channel.send(
+                f"{mention} — Submissions are open!{test_tag}\n\n"
+                f"**Day 1: {day1_str}**\n\n"
+                f"@mention me here with:\n"
+                f"• A screenshot of your in-game **Resources & Speedups** page\n"
+                f"• Your available times for **Day 1, Day 2, and Day 4** "
+                f"(in your local timezone or UTC — I'll convert)\n\n"
+                f"You can update either at any time before the lock. "
+                f"I'll confirm what I understood from each message."
             )
-
-        if submission.raw_availability_text:
-            lines.append(f"**Availability on file:** {submission.raw_availability_text}")
-
-        if not lines:
-            lines.append("I don't have any data for you yet.")
-
-        missing = []
-        if not submission.has_screenshot:
-            missing.append("screenshot")
-        if not submission.has_availability:
-            missing.append("availability")
-        if missing:
-            lines.append(f"Still needed: {', '.join(missing)}")
-
-        await message.reply("\n".join(lines))
 
 
 async def setup(bot: commands.Bot):
