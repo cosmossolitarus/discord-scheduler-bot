@@ -70,7 +70,7 @@ async def migrate_db() -> None:
     # member_name must match the Python enum member name (not the .value).
     enum_additions = [
         ("changetype",  "ADD"),       # request_new_slot
-        ("eventphase",  "published"), # new PUBLISHED phase (value, not member name)
+        ("eventphase",  "PUBLISHED"), # uppercase: SQLAlchemy stores enum .name not .value
     ]
 
     # New nullable columns added to existing tables.
