@@ -1006,6 +1006,272 @@ class Admin(commands.Cog):
             f"Admin {interaction.user} swapped {player_a.id} and {player_b.id} on day {day}"
         )
 
+    # ─── incomplete ───────────────────────────────────────────
+
+    @schedule.command(
+        name="incomplete",
+        description="List players with incomplete submissions",
+    )
+    @is_admin()
+    async def schedule_incomplete(self, interaction: discord.Interaction):
+        async with async_session() as session:
+            event = await _get_active_event(session)
+            if event is None:
+                await interaction.response.send_message("No active event.")
+                return
+
+            result = await session.execute(
+                select(Submission).where(Submission.event_id == event.event_id)
+            )
+            all_subs = list(result.scalars().all())
+
+        incomplete = [
+            s for s in all_subs
+            if not (s.has_screenshot and s.has_availability and s.has_player_id and s.has_resources)
+        ]
+
+        if not incomplete:
+            await interaction.response.send_message("All submissions are complete.")
+            return
+
+        lines = [f"**{len(incomplete)} incomplete submission(s):**\n"]
+        for sub in incomplete:
+            member = interaction.guild.get_member(sub.discord_id)
+            name = member.display_name if member else str(sub.discord_id)
+            missing = []
+            if not sub.has_screenshot:
+                missing.append("screenshot")
+            if not sub.has_availability:
+                missing.append("availability")
+            if not sub.has_player_id:
+                missing.append("player ID")
+            if not sub.has_resources:
+                missing.append("resources")
+            lines.append(f"• **{name}** — missing: {', '.join(missing)}")
+
+        await interaction.response.send_message("\n".join(lines))
+
+    # ─── nudge ────────────────────────────────────────────────
+
+    @schedule.command(
+        name="nudge",
+        description="DM players with incomplete submissions about what they're still missing",
+    )
+    @app_commands.describe(
+        player="DM only this player. Leave blank to nudge all incomplete players.",
+    )
+    @is_admin()
+    async def schedule_nudge(
+        self,
+        interaction: discord.Interaction,
+        player: discord.Member | None = None,
+    ):
+        async with async_session() as session:
+            event = await _get_active_event(session)
+            if event is None:
+                await interaction.response.send_message("No active event.")
+                return
+
+            if player is not None:
+                result = await session.execute(
+                    select(Submission).where(
+                        Submission.event_id == event.event_id,
+                        Submission.discord_id == player.id,
+                    )
+                )
+                targets = list(result.scalars().all())
+            else:
+                result = await session.execute(
+                    select(Submission).where(Submission.event_id == event.event_id)
+                )
+                targets = [
+                    s for s in result.scalars().all()
+                    if not (s.has_screenshot and s.has_availability and s.has_player_id and s.has_resources)
+                ]
+
+        from bot.config import SCHEDULING_CHANNEL
+        sent, skipped = 0, 0
+        for sub in targets:
+            if sub.has_screenshot and sub.has_availability and sub.has_player_id and sub.has_resources:
+                continue
+            missing = []
+            if not sub.has_screenshot:
+                missing.append("a **screenshot** of your in-game Speedups page")
+            if not sub.has_availability:
+                missing.append("your **availability** for Day 1, Day 2, or Day 4")
+            if not sub.has_player_id:
+                missing.append("your **in-game player ID**")
+            if not sub.has_resources:
+                missing.append("your **TTG, TG, and Dust** counts (say '0 TTG, 0 TG, 0 Dust' if you have none)")
+
+            member = interaction.guild.get_member(sub.discord_id)
+            if member is None:
+                skipped += 1
+                continue
+
+            dm_lines = [
+                f"Hey {member.display_name}! Your submission for the upcoming KvK schedule is not yet complete.",
+                "",
+                "**You still need to provide:**",
+            ]
+            for item in missing:
+                dm_lines.append(f"• {item}")
+            dm_lines.append("")
+            dm_lines.append(f"Please @mention the bot in #{SCHEDULING_CHANNEL} with the missing info.")
+
+            try:
+                await member.send("\n".join(dm_lines))
+                sent += 1
+            except discord.Forbidden:
+                skipped += 1
+
+        parts = [f"Nudged {sent} player(s)."]
+        if skipped:
+            parts.append(f"{skipped} couldn't be DM'd (not in server or DMs disabled).")
+        await interaction.response.send_message(" ".join(parts))
+        logger.info(f"Admin {interaction.user} nudged {sent} players (skipped {skipped})")
+
+    # ─── admin-submit ─────────────────────────────────────────
+
+    @schedule.command(
+        name="admin-submit",
+        description="Create or update a full submission on behalf of a player (e.g. no-Discord members)",
+    )
+    @app_commands.describe(
+        player="The player to submit for",
+        construction="Construction Speedups in days",
+        research="Research Speedups in days",
+        training="Training/Soldier Speedups in days",
+        general="General (wildcard) Speedups in days",
+        ttg="Tempered Truegold count (0 if none)",
+        tg="Truegold count (0 if none)",
+        dust="Truegold Dust count (0 if none)",
+        player_id="In-game numeric player ID (6–12 digits)",
+        available_days="Comma-separated days to mark fully available (e.g. '1,2,4'). Default: all days.",
+    )
+    @is_admin()
+    async def schedule_admin_submit(
+        self,
+        interaction: discord.Interaction,
+        player: discord.Member,
+        construction: float,
+        research: float,
+        training: float,
+        general: float,
+        ttg: int,
+        tg: int,
+        dust: int,
+        player_id: str,
+        available_days: str = "1,2,4",
+    ):
+        import re as _re
+        if not _re.match(r"^\d{6,12}$", player_id.strip()):
+            await interaction.response.send_message(
+                f"Invalid player ID '{player_id}' — expected 6–12 digits."
+            )
+            return
+
+        days_raw = [d.strip() for d in available_days.split(",")]
+        valid_days = []
+        for d in days_raw:
+            try:
+                n = int(d)
+                if n in (1, 2, 4):
+                    valid_days.append(n)
+            except ValueError:
+                pass
+        if not valid_days:
+            await interaction.response.send_message(
+                "available_days must contain at least one of: 1, 2, 4."
+            )
+            return
+
+        async with async_session() as session:
+            event = await _get_active_event(session)
+            if event is None:
+                await interaction.response.send_message("No active event.")
+                return
+            if event.phase not in (EventPhase.COLLECTING, EventPhase.LOCKED):
+                await interaction.response.send_message(
+                    f"admin-submit only works during COLLECTING or LOCKED "
+                    f"(current phase: {event.phase.value})."
+                )
+                return
+
+            event_id = event.event_id
+            day1 = event.day1_date
+
+            # Collect all slot IDs for the requested days
+            slot_result = await session.execute(
+                select(Slot).where(
+                    Slot.event_id == event_id,
+                    Slot.day.in_(valid_days),
+                )
+            )
+            all_day_slots = list(slot_result.scalars().all())
+            availability = [s.slot_id for s in all_day_slots]
+
+            # Upsert submission
+            sub_result = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event_id,
+                    Submission.discord_id == player.id,
+                )
+            )
+            sub = sub_result.scalar_one_or_none()
+            if sub is None:
+                sub = Submission(
+                    event_id=event_id,
+                    discord_id=player.id,
+                    discord_name=player.display_name,
+                )
+                session.add(sub)
+
+            sub.discord_name = player.display_name
+            sub.speedup_construction = float(construction)
+            sub.speedup_research = float(research)
+            sub.speedup_training = float(training)
+            sub.speedup_general = float(general)
+            sub.has_screenshot = True
+            sub.ttg = float(ttg)
+            sub.tg = float(tg)
+            sub.dust = float(dust)
+            sub.has_resources = True
+            sub.player_ingame_id = player_id.strip()
+            sub.has_player_id = True
+            sub.availability = availability
+            sub.has_availability = bool(availability)
+            sub.compute_priorities()
+
+            # Update cross-event PlayerProfile
+            from bot.llm.handlers_collecting import _upsert_player_profile
+            await session.flush()
+            await _upsert_player_profile(session, player.id, player_id.strip())
+
+            session.add(AuditLog(
+                event_id=event_id,
+                action="Admin created/updated submission on behalf of player",
+                actor=str(interaction.user),
+                details={"player": player.id, "days": valid_days},
+            ))
+            await session.commit()
+
+        await interaction.response.send_message(
+            f"Submission set for **{player.display_name}**:\n"
+            f"Speedups: construction={construction}, research={research}, "
+            f"training={training}, general={general}\n"
+            f"Resources: TTG={ttg}, TG={tg}, Dust={dust}\n"
+            f"Player ID: {player_id.strip()}\n"
+            f"Available days: {', '.join(str(d) for d in valid_days)} "
+            f"({len(availability)} slots)\n"
+            f"Priorities: D1={sub.priority_x:.0f}pts, D2={sub.priority_y:.0f}pts, "
+            f"D4={sub.priority_z:.2f}d"
+        )
+        logger.info(
+            f"Admin {interaction.user} admin-submitted for {player.id} "
+            f"days={valid_days} id={player_id.strip()}"
+        )
+
     # ─── waitlist ─────────────────────────────────────────────
 
     @schedule.command(

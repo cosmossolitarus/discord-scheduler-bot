@@ -156,6 +156,7 @@ SET_RESOURCES = {
         "Use when the user reports their premium resource counts: "
         "Tempered Truegold (TTG / refined TG / refined truegold), "
         "Truegold (TG), and/or Truegold Dust (dust / TG dust). "
+        "If the user says they have NONE or ZERO of all resources, set ttg=0, tg=0, dust=0. "
         "Only set the fields the user actually mentioned; omit the rest. "
         "These affect Day 1 (TTG, TG) and Day 2 (Dust) scheduling priority."
     ),

@@ -245,6 +245,11 @@ async def handle_set_resources(
             submission.dust = float(dust)
         submission.discord_name = user_name
 
+        # Mark resources complete only when all three have been explicitly set
+        # (even as 0). A player must report TTG, TG, and Dust to be complete.
+        if submission.ttg is not None and submission.tg is not None and submission.dust is not None:
+            submission.has_resources = True
+
         if submission.has_screenshot:
             submission.compute_priorities()
 

@@ -81,6 +81,7 @@ async def migrate_db() -> None:
         ("submissions", "dust",              "double precision"),
         ("submissions", "player_ingame_id",  "varchar(20)"),
         ("submissions", "has_player_id",     "boolean DEFAULT false NOT NULL"),
+        ("submissions", "has_resources",     "boolean DEFAULT false NOT NULL"),
         ("events",      "published_at",      "timestamptz"),
     ]
 

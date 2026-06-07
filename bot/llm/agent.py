@@ -65,7 +65,8 @@ Day 3 and Day 5 are not tracked.
   (e.g. "my ID is 12345678"). 6–12 digits only. Do NOT use for Discord IDs.
 - `set_resources`: user is reporting how many TTG (Tempered Truegold / refined TG), \
   TG (Truegold), or Dust (Truegold Dust / TG dust) they have. Only set the fields \
-  they mentioned. These are integer counts, not time values.
+  they mentioned. If the user says they have NONE or ZERO of all resources, set \
+  ttg=0, tg=0, dust=0. These are integer counts, not time values.
 
 ### Change-request tools (PUBLISHED phase only)
 - `widen_availability`: user wants to ADD more available times on top of existing.
@@ -373,11 +374,11 @@ def _render_set_player_id(inp: dict) -> str:
 
 
 def _render_out_of_scope(inp: dict) -> str:
-    reason = (inp.get("reason") or "").strip()
-    base = "I only handle availability and Speedups for **Day 1, Day 2, and Day 4**."
-    if reason:
-        return f"{base}\n_{reason}_"
-    return base
+    return (
+        "I only handle scheduling for **Day 1, Day 2, and Day 4**: "
+        "availability windows, Speedups screenshot, in-game player ID, "
+        "and TTG/TG/Dust resource counts."
+    )
 
 
 def _render_clarify(inp: dict) -> str:
@@ -392,22 +393,22 @@ def _render_greet(state: dict) -> str:
     avail_tag = "  (already on file)" if sub["has_availability"] else ""
     screen_tag = "  (already on file)" if sub["has_screenshot"] else ""
     id_tag = "  (already on file)" if sub["has_player_id"] else ""
+    res_tag = "  (already on file)" if sub["has_resources"] else ""
     lines = [
         "**Hi!** I'm the scheduling bot. I track 30-minute time slots on **Day 1, Day 2, and Day 4**.",
         "",
-        "**To be added to the schedule, I need:**",
+        "**To be added to the schedule, I need all four of these:**",
         f"1. **Availability** — at least one time window on Day 1, 2, or 4{avail_tag}",
         f"2. **Speedups screenshot** — your in-game Speedups page{screen_tag}",
         f"3. **Player ID** — your in-game numeric player ID{id_tag}",
-        "",
-        "**Optionally, to improve your priority:**",
-        "  Tell me your **TTG, TG, and Dust** counts (e.g. 'I have 3 TTG, 50 TG, 200 dust')",
+        f"4. **Resources** — your TTG, TG, and Dust counts (say '0 TTG, 0 TG, 0 Dust' if you have none){res_tag}",
         "",
         "**Examples:**",
         "  \"Day 1 from 2pm to 6pm EST\"",
         "  \"Day 2 anytime, Day 4 after 8pm UTC\"",
         "  \"My player ID is 12345678\"",
-        "  \"I have 5 TTG and 100 TG\"",
+        "  \"I have 5 TTG, 100 TG, and 0 dust\"",
+        "  \"0 TTG, 0 TG, 0 dust\"",
         "  \"What are my times?\"",
     ]
     return "\n".join(lines)
@@ -442,7 +443,7 @@ async def _completeness_status(
         missing.append("your **in-game player ID**")
         return "🚨 You still need to send: " + "; ".join(missing) + " before I can add you to the schedule."
 
-    is_complete = sub.has_screenshot and sub.has_availability and sub.has_player_id
+    is_complete = sub.has_screenshot and sub.has_availability and sub.has_player_id and sub.has_resources
     if is_complete:
         if not was_complete_before:
             return (
@@ -459,11 +460,51 @@ async def _completeness_status(
         missing.append("your availability for Day 1, Day 2, or Day 4")
     if not sub.has_player_id:
         missing.append("your **in-game player ID**")
+    if not sub.has_resources:
+        missing.append("your **TTG, TG, and Dust** counts (say '0 TTG, 0 TG, 0 Dust' if you have none)")
 
     if not missing:
         return None
 
     return "🚨 You still need: " + "; ".join(missing) + "."
+
+
+# ─── Translation ────────────────────────────────────────────────
+
+
+async def _translate_reply(original_text: str, english_reply: str) -> str:
+    """If the user's message is non-English, translate english_reply to match.
+
+    Uses a lightweight LLM call. On any failure, returns the English original.
+    Discord markdown (**, *, ✅, ❌, 🚨) is preserved by instruction.
+    """
+    if not original_text.strip():
+        return english_reply
+    try:
+        response = await _client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2048,
+            system=(
+                "You are a translator for a Discord scheduling bot. "
+                "Given an INPUT MESSAGE and a REPLY TEXT:\n"
+                "1. If the INPUT MESSAGE is in English (or contains no meaningful non-English words), "
+                "respond with exactly: ENGLISH\n"
+                "2. Otherwise, translate ONLY the REPLY TEXT into the same language as the INPUT MESSAGE. "
+                "Translate directly — do not add, remove, or rephrase any information. "
+                "Preserve all Discord markdown formatting (**, *, ✅, ❌, 🚨, bullet points, newlines)."
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"INPUT MESSAGE:\n{original_text}\n\nREPLY TEXT:\n{english_reply}",
+            }],
+        )
+        result = response.content[0].text.strip()
+        if result == "ENGLISH":
+            return english_reply
+        return result
+    except Exception:
+        logger.warning("Translation LLM call failed — returning English reply")
+        return english_reply
 
 
 # ─── LLM parse call ─────────────────────────────────────────────
@@ -528,6 +569,7 @@ async def process_user_message(
         pre_state["submission"]["has_screenshot"]
         and pre_state["submission"]["has_availability"]
         and pre_state["submission"]["has_player_id"]
+        and pre_state["submission"]["has_resources"]
     )
 
     # Parse + save screenshots silently
@@ -620,4 +662,7 @@ async def process_user_message(
     if status:
         sections.append(status)
 
-    return "\n\n".join(s for s in sections if s).strip() or "I processed your message but had nothing to say."
+    reply = "\n\n".join(s for s in sections if s).strip() or "I processed your message but had nothing to say."
+    if text:
+        reply = await _translate_reply(text, reply)
+    return reply

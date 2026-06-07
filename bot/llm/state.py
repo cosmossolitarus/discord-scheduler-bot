@@ -46,6 +46,7 @@ async def build_state_envelope(
         "has_screenshot": bool(submission and submission.has_screenshot),
         "has_availability": bool(submission and submission.has_availability),
         "has_player_id": bool(submission and submission.has_player_id),
+        "has_resources": bool(submission and submission.has_resources),
         "player_ingame_id": submission.player_ingame_id if submission else None,
         "speedups": None,
         "resources": None,
@@ -61,7 +62,7 @@ async def build_state_envelope(
             "generic_split": GENERIC_SPLIT,
         }
 
-    if submission and any([submission.ttg, submission.tg, submission.dust]):
+    if submission and submission.has_resources:
         submission_dict["resources"] = {
             "ttg": submission.ttg or 0,
             "tg": submission.tg or 0,
@@ -158,6 +159,7 @@ def render_state_for_prompt(state: dict) -> str:
         f"  Player ID on file: "
         f"{'yes (' + sub['player_ingame_id'] + ')' if sub['has_player_id'] and sub['player_ingame_id'] else 'no'}"
     )
+    parts.append(f"  Resources on file: {'yes' if sub['has_resources'] else 'no'}")
 
     if sub["speedups"]:
         r = sub["speedups"]

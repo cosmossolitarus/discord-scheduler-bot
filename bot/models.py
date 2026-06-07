@@ -144,6 +144,10 @@ class Submission(Base):
     player_ingame_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
     has_player_id: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Premium resource counts. has_resources becomes True only when all three
+    # (ttg, tg, dust) have been explicitly set — even if the values are 0.
+    has_resources: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     # Speedup durations in days (from screenshot).
     speedup_construction: Mapped[float | None] = mapped_column(Float, nullable=True)
     speedup_research: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -191,7 +195,7 @@ class Submission(Base):
 
     @property
     def is_complete(self) -> bool:
-        return self.has_screenshot and self.has_availability and self.has_player_id
+        return self.has_screenshot and self.has_availability and self.has_player_id and self.has_resources
 
     def compute_priorities(self, generic_split: int = 3) -> None:
         """Compute optimizer priority scores from stored resource values.
