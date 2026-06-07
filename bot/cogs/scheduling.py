@@ -22,6 +22,7 @@ from sqlalchemy import select
 
 from bot.config import (
     ADMIN_ROLE,
+    MOJ_ROLE,
     PLAYER_ROLE,
     SCHEDULE_LOG_CHANNEL,
     SCHEDULING_CHANNEL,
@@ -142,11 +143,16 @@ class Scheduling(commands.Cog):
 
         for guild in self.bot.guilds:
             log_channel = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
-            admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
-            if log_channel and admin_role:
+            if log_channel:
+                staff_mention = " ".join(
+                    r.mention for r in [
+                        discord.utils.get(guild.roles, name=ADMIN_ROLE),
+                        discord.utils.get(guild.roles, name=MOJ_ROLE),
+                    ] if r is not None
+                )
                 test_tag = " (test)" if event.is_test else ""
                 await log_channel.send(
-                    f"{admin_role.mention} — Schedule locked and optimized{test_tag}. "
+                    f"{staff_mention} — Schedule locked and optimized{test_tag}. "
                     f"**Review before publishing.** "
                     f"{len(assigned_users)} players assigned across "
                     f"{sum(len(v) for v in results.values() if isinstance(v, list))} slots.\n"
@@ -193,14 +199,20 @@ class Scheduling(commands.Cog):
 
         for guild in self.bot.guilds:
             log_channel = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
-            admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
             scheduling_channel = discord.utils.get(guild.text_channels, name=SCHEDULING_CHANNEL)
             player_role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
 
-            if log_channel and admin_role:
+            if log_channel:
+                staff_mention = " ".join(
+                    r.mention for r in [
+                        discord.utils.get(guild.roles, name=ADMIN_ROLE),
+                        discord.utils.get(guild.roles, name=MOJ_ROLE),
+                    ] if r is not None
+                )
                 test_tag = " (test)" if event.is_test else ""
                 await log_channel.send(
-                    f"Schedule published{test_tag} — {len(assigned_users)} players notified.",
+                    f"{staff_mention} — Schedule published{test_tag}. "
+                    f"{len(assigned_users)} players notified.",
                     file=discord.File(csv_file, filename=f"schedule_{day1.date()}.csv"),
                 )
 

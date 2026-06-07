@@ -26,7 +26,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import func, select
 
-from bot.config import ADMIN_ROLE
+from bot.config import ADMIN_ROLE, MOJ_ROLE
 from bot.cycle import get_cycle_dates
 from bot.database import async_session
 from bot.events import create_event
@@ -41,6 +41,7 @@ from bot.models import (
     Slot,
     Submission,
 )
+from bot.optimizer.solver import AssignmentResult, SlotForOptimizer, UserForOptimizer, optimize_pass
 
 logger = logging.getLogger("scheduler.admin")
 
@@ -50,9 +51,11 @@ logger = logging.getLogger("scheduler.admin")
 
 def is_admin():
     async def predicate(interaction: discord.Interaction) -> bool:
-        role = discord.utils.get(interaction.guild.roles, name=ADMIN_ROLE)
-        if role and role in interaction.user.roles:
-            return True
+        user_roles = interaction.user.roles
+        for role_name in (ADMIN_ROLE, MOJ_ROLE):
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if role and role in user_roles:
+                return True
         raise app_commands.MissingRole(ADMIN_ROLE)
     return app_commands.check(predicate)
 
@@ -1270,6 +1273,280 @@ class Admin(commands.Cog):
         logger.info(
             f"Admin {interaction.user} admin-submitted for {player.id} "
             f"days={valid_days} id={player_id.strip()}"
+        )
+
+    # ─── clear-track ──────────────────────────────────────────
+
+    @schedule.command(
+        name="clear-track",
+        description="Clear assignments for one day/track without touching other tracks",
+    )
+    @app_commands.describe(
+        day="Day to clear (1, 2, or 4)",
+        track="Track to clear: CM or NA. Leave blank to clear all tracks on that day.",
+    )
+    @is_admin()
+    async def schedule_clear_track(
+        self,
+        interaction: discord.Interaction,
+        day: int,
+        track: str | None = None,
+    ):
+        now = datetime.now(timezone.utc)
+
+        if day not in (1, 2, 4):
+            await interaction.response.send_message("Day must be 1, 2, or 4.")
+            return
+        if track is not None:
+            track = track.upper()
+            if track not in ("CM", "NA"):
+                await interaction.response.send_message("Track must be CM or NA.")
+                return
+            if track == "NA" and day != 4:
+                await interaction.response.send_message("NA track is only available on Day 4.")
+                return
+
+        async with async_session() as session:
+            event = await _get_active_event(session)
+            if event is None:
+                await interaction.response.send_message("No active event.")
+                return
+            if event.phase == EventPhase.COLLECTING:
+                await interaction.response.send_message(
+                    "No assignments exist during COLLECTING."
+                )
+                return
+
+            event_id = event.event_id
+
+            # Find target slot IDs
+            slot_q = select(Slot).where(Slot.event_id == event_id, Slot.day == day)
+            if track is not None:
+                slot_q = slot_q.where(Slot.track == track)
+            slot_res = await session.execute(slot_q)
+            target_slots = list(slot_res.scalars().all())
+
+            if not target_slots:
+                await interaction.response.send_message(
+                    f"No slots found for Day {day}{' ' + track if track else ''}."
+                )
+                return
+
+            # During PUBLISHED, refuse if any slot has already started
+            if event.phase == EventPhase.PUBLISHED:
+                started = [s for s in target_slots if s.start_time < now]
+                if started:
+                    await interaction.response.send_message(
+                        f"Cannot clear: {len(started)} slot(s) in this track have already started. "
+                        f"Use `/schedule remove-player` for individual future slots."
+                    )
+                    return
+
+            slot_ids = [s.slot_id for s in target_slots]
+            count_res = await session.execute(
+                select(func.count()).select_from(Assignment).where(
+                    Assignment.event_id == event_id,
+                    Assignment.slot_id.in_(slot_ids),
+                )
+            )
+            cleared = count_res.scalar() or 0
+
+            await session.execute(
+                Assignment.__table__.delete().where(
+                    Assignment.event_id == event_id,
+                    Assignment.slot_id.in_(slot_ids),
+                )
+            )
+            track_label = track if track else "all tracks"
+            session.add(AuditLog(
+                event_id=event_id,
+                action=f"Admin cleared assignments for Day {day} {track_label}",
+                actor=str(interaction.user),
+                details={"day": day, "track": track, "cleared": cleared},
+            ))
+            await session.commit()
+
+        await interaction.response.send_message(
+            f"Cleared {cleared} assignment(s) for Day {day} "
+            f"{'(' + track + ')' if track else '(all tracks)'}. "
+            f"Other days/tracks are unchanged."
+        )
+        logger.info(
+            f"Admin {interaction.user} cleared Day {day} {track_label} "
+            f"({cleared} assignments)"
+        )
+
+    # ─── reoptimize ───────────────────────────────────────────
+
+    @schedule.command(
+        name="reoptimize",
+        description="Re-run the optimizer for one day/track, preserving all other assignments",
+    )
+    @app_commands.describe(
+        day="Day to re-optimize (1, 2, or 4)",
+        track="Track: CM or NA (NA only valid for Day 4)",
+    )
+    @is_admin()
+    async def schedule_reoptimize(
+        self,
+        interaction: discord.Interaction,
+        day: int,
+        track: str,
+    ):
+        now = datetime.now(timezone.utc)
+        track = track.upper()
+
+        if day not in (1, 2, 4):
+            await interaction.response.send_message("Day must be 1, 2, or 4.")
+            return
+        if track not in ("CM", "NA"):
+            await interaction.response.send_message("Track must be CM or NA.")
+            return
+        if track == "NA" and day != 4:
+            await interaction.response.send_message("NA track is only available on Day 4.")
+            return
+
+        pass_key = f"D{day}-{track}"
+        priority_field = "priority_y" if day == 2 else ("priority_x" if day == 1 else "priority_z")
+
+        async with async_session() as session:
+            event = await _get_active_event(session)
+            if event is None:
+                await interaction.response.send_message("No active event.")
+                return
+            if event.phase == EventPhase.COLLECTING:
+                await interaction.response.send_message(
+                    "Cannot reoptimize during COLLECTING — run /schedule lock first."
+                )
+                return
+
+            event_id = event.event_id
+
+            # During PUBLISHED, refuse if any slot in this track has started
+            if event.phase == EventPhase.PUBLISHED:
+                slot_check = await session.execute(
+                    select(Slot).where(
+                        Slot.event_id == event_id,
+                        Slot.day == day,
+                        Slot.track == track,
+                        Slot.start_time < now,
+                    )
+                )
+                if slot_check.scalars().first() is not None:
+                    await interaction.response.send_message(
+                        f"Cannot reoptimize {pass_key}: slots have already started. "
+                        f"Use `/schedule assign` for individual manual changes."
+                    )
+                    return
+
+            # Load slots for this pass
+            slot_res = await session.execute(
+                select(Slot).where(
+                    Slot.event_id == event_id,
+                    Slot.day == day,
+                    Slot.track == track,
+                ).order_by(Slot.slot_index)
+            )
+            optimizer_slots = [
+                SlotForOptimizer(slot_id=s.slot_id, slot_index=s.slot_index)
+                for s in slot_res.scalars().all()
+            ]
+            if not optimizer_slots:
+                await interaction.response.send_message(f"No slots found for {pass_key}.")
+                return
+
+            # Load eligible submissions (need screenshot + availability)
+            sub_res = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event_id,
+                    Submission.has_screenshot == True,   # noqa: E712
+                    Submission.has_availability == True,  # noqa: E712
+                )
+            )
+            submissions = list(sub_res.scalars().all())
+
+            # Determine cross-track exclusions from EXISTING assignments
+            excluded_ids: set[int] = set()
+
+            if day == 2 and track == "CM":
+                # Exclude whoever currently holds the boundary slot D1-CM-49
+                bnd = await session.execute(
+                    select(Assignment.discord_id).where(
+                        Assignment.event_id == event_id,
+                        Assignment.slot_id == "D1-CM-49",
+                    )
+                )
+                bid = bnd.scalar_one_or_none()
+                if bid is not None:
+                    excluded_ids.add(bid)
+
+            if day == 4 and track == "CM":
+                # Exclude anyone already holding a D4-NA slot
+                d4na = await session.execute(
+                    select(Assignment.discord_id)
+                    .join(Slot, Assignment.slot_id == Slot.slot_id)
+                    .where(
+                        Assignment.event_id == event_id,
+                        Slot.day == 4,
+                        Slot.track == "NA",
+                    )
+                )
+                excluded_ids.update(d4na.scalars().all())
+
+            # Build user list
+            slot_set = {s.slot_id for s in optimizer_slots}
+            users = [
+                UserForOptimizer(
+                    discord_id=s.discord_id,
+                    priority=getattr(s, priority_field) or 0,
+                    available_slots=set(s.availability or []) & slot_set,
+                )
+                for s in submissions
+                if s.discord_id not in excluded_ids
+                and set(s.availability or []) & slot_set
+            ]
+
+            # Run optimizer
+            new_assignments = optimize_pass(users, optimizer_slots)
+
+            # Replace only this track's assignments
+            await session.execute(
+                Assignment.__table__.delete().where(
+                    Assignment.event_id == event_id,
+                    Assignment.slot_id.in_(slot_set),
+                )
+            )
+            for a in new_assignments:
+                session.add(Assignment(
+                    event_id=event_id,
+                    slot_id=a.slot_id,
+                    discord_id=a.discord_id,
+                ))
+
+            excl_note = ""
+            if excluded_ids:
+                excl_note = f" ({len(excluded_ids)} player(s) excluded by cross-track constraint)"
+            session.add(AuditLog(
+                event_id=event_id,
+                action=f"Admin re-optimized {pass_key}",
+                actor=str(interaction.user),
+                details={
+                    "pass": pass_key,
+                    "candidates": len(users),
+                    "assigned": len(new_assignments),
+                    "excluded": list(excluded_ids),
+                },
+            ))
+            await session.commit()
+
+        await interaction.response.send_message(
+            f"Re-optimized **{pass_key}**: {len(new_assignments)} players assigned "
+            f"from {len(users)} candidates{excl_note}. "
+            f"All other tracks are unchanged."
+        )
+        logger.info(
+            f"Admin {interaction.user} reoptimized {pass_key}: "
+            f"{len(new_assignments)} assigned, excluded={excluded_ids}"
         )
 
     # ─── waitlist ─────────────────────────────────────────────

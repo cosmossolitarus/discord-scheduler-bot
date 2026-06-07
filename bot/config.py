@@ -19,6 +19,7 @@ GUILD_ID = os.environ.get("DISCORD_GUILD_ID")  # Optional: enables instant slash
 # Case-sensitive Discord role names. Override via env vars if your server
 # uses different names.
 ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "Admin")
+MOJ_ROLE   = os.environ.get("MOJ_ROLE",   "MOJ")
 PLAYER_ROLE = os.environ.get("PLAYER_ROLE", "Kingdom 231")
 
 # ─── Discord Channels ───────────────────────────────────────────

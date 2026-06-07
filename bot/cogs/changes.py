@@ -30,6 +30,7 @@ from sqlalchemy import select
 
 from bot.config import (
     ADMIN_ROLE,
+    MOJ_ROLE,
     SCHEDULE_APPROVE_CHANNEL,
     SCHEDULE_LOG_CHANNEL,
 )
@@ -94,10 +95,13 @@ class Changes(commands.Cog):
         guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
         if guild is None:
             return
-        admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
         member = guild.get_member(payload.user_id)
-        if member is None or admin_role is None or admin_role not in member.roles:
-            return  # not an admin — ignore
+        if member is None:
+            return
+        admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+        moj_role = discord.utils.get(guild.roles, name=MOJ_ROLE)
+        if not any(r in member.roles for r in (admin_role, moj_role) if r is not None):
+            return  # not an admin or MOJ — ignore
 
         async with async_session() as session:
             result = await session.execute(
@@ -535,8 +539,12 @@ class Changes(commands.Cog):
             ch = discord.utils.get(guild.text_channels, name=SCHEDULE_APPROVE_CHANNEL)
             if ch is None:
                 continue
-            admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
-            mention = admin_role.mention if admin_role else ""
+            mention = " ".join(
+                r.mention for r in [
+                    discord.utils.get(guild.roles, name=ADMIN_ROLE),
+                    discord.utils.get(guild.roles, name=MOJ_ROLE),
+                ] if r is not None
+            )
             msg = await ch.send(f"{mention}\n{body}".strip())
             try:
                 await msg.add_reaction(_OK)
