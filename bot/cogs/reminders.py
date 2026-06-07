@@ -24,6 +24,7 @@ from bot.models import (
     ChangeRequest,
     ChangeStatus,
     Event,
+    EventPhase,
     SentReminder,
     Slot,
 )
@@ -38,49 +39,51 @@ class Reminders(commands.Cog):
     # ─── Lifecycle entry point ──────────────────────────────
 
     async def check_reminders(self, now: datetime, event: Event):
-        """Per-tick reminder work for a locked event.
+        """Per-tick reminder work for LOCKED and PUBLISHED events.
 
-        Called by the lifecycle loop. Uses only event.event_id and
-        event.day1_date, which are always loaded on the inbound object.
+        Called by the lifecycle loop. Daily channel reminders and personal DMs
+        are sent only during PUBLISHED (players don't know their slots until
+        then). Change-request expiration runs regardless of phase.
         """
         event_id = event.event_id
         day1 = event.day1_date
-
-        daily_reminder_times = {
-            1: day1 - timedelta(hours=1),
-            2: day1 + timedelta(hours=23),
-            4: day1 + timedelta(days=2, hours=23),
-        }
+        is_published = event.phase == EventPhase.PUBLISHED
 
         async with async_session() as session:
-            for game_day, reminder_time in daily_reminder_times.items():
-                if not (reminder_time <= now < reminder_time + timedelta(minutes=1)):
-                    continue
-                if await self._already_sent(session, event_id, "daily", str(game_day)):
-                    continue
-                if await self._send_daily_reminder(event_id, game_day):
-                    session.add(SentReminder(
-                        event_id=event_id, kind="daily", key=str(game_day),
-                    ))
+            if is_published:
+                daily_reminder_times = {
+                    1: day1 - timedelta(hours=1),
+                    2: day1 + timedelta(hours=23),
+                    4: day1 + timedelta(days=2, hours=23),
+                }
+                for game_day, reminder_time in daily_reminder_times.items():
+                    if not (reminder_time <= now < reminder_time + timedelta(minutes=1)):
+                        continue
+                    if await self._already_sent(session, event_id, "daily", str(game_day)):
+                        continue
+                    if await self._send_daily_reminder(event_id, game_day):
+                        session.add(SentReminder(
+                            event_id=event_id, kind="daily", key=str(game_day),
+                        ))
 
-            target_start = now + timedelta(minutes=PERSONAL_REMINDER_MINUTES)
-            target_end = target_start + timedelta(minutes=1)
-            result = await session.execute(
-                select(Assignment, Slot)
-                .join(Slot, Assignment.slot_id == Slot.slot_id)
-                .where(
-                    Assignment.event_id == event_id,
-                    Slot.start_time >= target_start,
-                    Slot.start_time < target_end,
+                target_start = now + timedelta(minutes=PERSONAL_REMINDER_MINUTES)
+                target_end = target_start + timedelta(minutes=1)
+                result = await session.execute(
+                    select(Assignment, Slot)
+                    .join(Slot, Assignment.slot_id == Slot.slot_id)
+                    .where(
+                        Assignment.event_id == event_id,
+                        Slot.start_time >= target_start,
+                        Slot.start_time < target_end,
+                    )
                 )
-            )
-            for assignment, slot in result.all():
-                if await self._already_sent(session, event_id, "personal", slot.slot_id):
-                    continue
-                await self._send_personal_reminder(assignment, slot)
-                session.add(SentReminder(
-                    event_id=event_id, kind="personal", key=slot.slot_id,
-                ))
+                for assignment, slot in result.all():
+                    if await self._already_sent(session, event_id, "personal", slot.slot_id):
+                        continue
+                    await self._send_personal_reminder(assignment, slot)
+                    session.add(SentReminder(
+                        event_id=event_id, kind="personal", key=slot.slot_id,
+                    ))
 
             await self._expire_overdue_changes(session, now)
             await session.commit()

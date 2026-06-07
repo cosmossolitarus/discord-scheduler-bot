@@ -1,16 +1,15 @@
 """
 Database models.
 
-Phase 1 cleanup applied:
-  - Event gains is_test, locked_at, archived_at.
-  - EventPhase.ACTIVE removed (was never written; "active" is computed at
-    display time as 'phase=LOCKED AND now >= day1').
-  - AssignmentStatus enum and column removed (only ASSIGNED was ever set,
-    so the row's existence already carries the same information).
-  - Submission.availability typed as list (it stores a list of slot IDs).
-
-ChangeRequest is left as-is; Phase 2's action-pattern rewrite will replace
-ChangeType and reshape ChangeRequest.details.
+Phase changes summary:
+  - EventPhase gains PUBLISHED; ARCHIVED is removed.
+    Lifecycle: COLLECTING → LOCKED (admin-private review) → PUBLISHED (players notified).
+  - Submission gains ttg, tg, dust (premium resource counts) and
+    player_ingame_id / has_player_id for the in-game numeric player ID.
+  - Event gains published_at timestamp.
+  - PlayerProfile (new) maps discord_id → ingame_player_id across events.
+  - compute_priorities() updated: Day 1 and Day 2 use points
+    (speedup minutes × 30 + premium-resource bonuses); Day 4 uses speedup days.
 """
 
 from datetime import datetime, timezone
@@ -40,18 +39,16 @@ from bot.database import Base
 class EventPhase(str, PyEnum):
     """Lifecycle phases for an Event row.
 
-    Real-event transitions (driven by the lifecycle loop):
-        (new)       → COLLECTING   when submissions window opens
-        COLLECTING  → LOCKED       when optimizer runs and schedule is released
-        LOCKED      → ARCHIVED     after the event days complete
-
-    Test events (is_test=True) stay in COLLECTING (or LOCKED if manually
-    locked) until an admin runs /schedule reset, which deletes them. They
-    never reach ARCHIVED.
+    Admin-driven transitions (no auto-transitions):
+        (new)       → COLLECTING   admin opens submissions (/schedule create)
+        COLLECTING  → LOCKED       admin locks (/schedule lock); optimizer runs;
+                                   schedule is visible to admins only.
+        LOCKED      → PUBLISHED    admin publishes (/schedule publish); player
+                                   DMs sent; public change-request flow begins.
     """
     COLLECTING = "collecting"
     LOCKED = "locked"
-    ARCHIVED = "archived"
+    PUBLISHED = "published"
 
 
 class ChangeStatus(str, PyEnum):
@@ -63,11 +60,9 @@ class ChangeStatus(str, PyEnum):
 
 
 class ChangeType(str, PyEnum):
-    """Categories of post-lock changes. Phase 2 will likely reshape this to
-    match the action-pattern verbs (move_slot, drop_slot, etc.)."""
     UPDATE = "update"
     SWAP = "swap"
-    ADD = "add"  # request_new_slot — user has no current assignment, asks for one
+    ADD = "add"
     ADMIN_OVERRIDE = "admin_override"
     AUTO_BUMP_FLAG = "auto_bump_flag"
 
@@ -93,6 +88,10 @@ class Event(Base):
     locked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # archived_at kept in DB for existing rows; never written going forward.
     archived_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -117,6 +116,22 @@ class Event(Base):
     )
 
 
+class PlayerProfile(Base):
+    """Persists the discord_id ↔ ingame_player_id mapping across events.
+
+    When a player submits their in-game ID during COLLECTING, this row is
+    upserted so the bot can pre-populate it for their next event without
+    asking again. Admin-injected assignments never write here.
+    """
+    __tablename__ = "player_profiles"
+
+    discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    ingame_player_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class Submission(Base):
     __tablename__ = "submissions"
 
@@ -125,20 +140,32 @@ class Submission(Base):
     discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     discord_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    # Raw Speedup numbers from the screenshot (x = construction, y = research,
-    # z = troops, generic = wildcard split across the three at GENERIC_SPLIT).
+    # In-game numeric player ID (8–10 digits). Submitted via text.
+    player_ingame_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    has_player_id: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Speedup durations in days (from screenshot).
     speedup_construction: Mapped[float | None] = mapped_column(Float, nullable=True)
     speedup_research: Mapped[float | None] = mapped_column(Float, nullable=True)
     speedup_training: Mapped[float | None] = mapped_column(Float, nullable=True)
     speedup_general: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # Speedup value + share of generic, used by the optimizer.
+    # Premium resource counts (submitted via text).
+    # TTG (Tempered Truegold) and TG (Truegold) boost Day 1 priority.
+    # Dust (Truegold Dust) boosts Day 2 priority.
+    ttg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dust: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Optimizer priority scores.
+    #   priority_x — Day 1, in points  (speedup-mins×30 + TTG×30000 + TG×2000)
+    #   priority_y — Day 2, in points  (speedup-mins×30 + Dust×1000)
+    #   priority_z — Day 4, in speedup days (training + general/3)
     priority_x: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority_y: Mapped[float | None] = mapped_column(Float, nullable=True)
     priority_z: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # Stored as a list of slot IDs the user is available for, e.g.
-    # ["D1-CM-12", "D1-CM-13", ...].
+    # List of slot IDs the user is available for.
     availability: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     screenshot_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -164,14 +191,40 @@ class Submission(Base):
 
     @property
     def is_complete(self) -> bool:
-        return self.has_screenshot and self.has_availability
+        return self.has_screenshot and self.has_availability and self.has_player_id
 
     def compute_priorities(self, generic_split: int = 3) -> None:
-        """Distribute the generic Speedup pool across x/y/z."""
-        generic_share = (self.speedup_general or 0) / generic_split
-        self.priority_x = (self.speedup_construction or 0) + generic_share
-        self.priority_y = (self.speedup_research or 0) + generic_share
-        self.priority_z = (self.speedup_training or 0) + generic_share
+        """Compute optimizer priority scores from stored resource values.
+
+        Day 1 (priority_x) and Day 2 (priority_y) are in points:
+            speedup_minutes × 30  +  premium-resource bonuses
+            (TTG = 30 000 pts, TG = 2 000 pts, Dust = 1 000 pts)
+
+        General speedups are split equally across all three days before
+        conversion, then added to each day's pool.
+
+        Day 4 (priority_z) remains in speedup days (no premium resources).
+        """
+        general_share_days = (self.speedup_general or 0) / generic_split
+        minutes_per_day = 1440
+
+        # Day 1 points
+        d1_speedup_min = ((self.speedup_construction or 0) + general_share_days) * minutes_per_day
+        self.priority_x = (
+            d1_speedup_min * 30
+            + (self.ttg or 0) * 30_000
+            + (self.tg or 0) * 2_000
+        )
+
+        # Day 2 points
+        d2_speedup_min = ((self.speedup_research or 0) + general_share_days) * minutes_per_day
+        self.priority_y = (
+            d2_speedup_min * 30
+            + (self.dust or 0) * 1_000
+        )
+
+        # Day 4 speedup days
+        self.priority_z = (self.speedup_training or 0) + general_share_days
 
 
 class Slot(Base):
@@ -258,17 +311,11 @@ class AuditLog(Base):
 
 
 class SentReminder(Base):
-    """One row per reminder we've already delivered, keyed by (event, kind, key).
+    """Deduplication table so reminders aren't re-sent after a bot restart.
 
-    Phase 3 replacement for the in-memory `_sent_reminders` set in the
-    Reminders cog. Persisting these means a bot restart doesn't re-send
-    daily reminders or personal 15-minute-warning DMs.
-
-    `kind` values currently in use:
+    `kind` values:
         "daily"    — daily channel announcement for game day N. key = str(N).
         "personal" — 15-minute DM warning. key = slot_id (e.g. "D2-CM-12").
-
-    Rows cascade-delete with the parent Event, so /schedule reset wipes them.
     """
     __tablename__ = "sent_reminders"
 

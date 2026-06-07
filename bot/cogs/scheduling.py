@@ -2,18 +2,14 @@
 Scheduling cog.
 
 Handles:
-    - Locking submissions and running the optimizer
-    - Generating schedule CSVs
-    - Releasing the schedule to players
-    - Archiving the final schedule
+  - lock_and_release(): run optimizer, post admin-only CSV + summary to #schedule_log
+  - publish(): send player DMs and announce in #scheduling
+  - CSV generation (all submission columns included)
 
-Phase 1b changes:
-    - lock_and_release and archive take an Event object instead of a day1.
-      Internally they re-fetch by event_id within their own session.
-    - Uses mark_locked / mark_archived from bot.events for phase transitions
-      (sets locked_at / archived_at timestamps).
-    - AssignmentStatus is gone; the row's existence carries the information.
-    - Boundary-slot DM gets the dual-Speedup notice on schedule release.
+lock() is now a two-step process:
+  1. Admin runs /schedule lock → optimizer runs → CSV sent to admins only (LOCKED phase)
+  2. Admin reviews, optionally edits via admin commands
+  3. Admin runs /schedule publish → player DMs sent, PUBLISHED phase begins
 """
 
 import csv
@@ -32,7 +28,7 @@ from bot.config import (
 )
 from bot.cycle import is_boundary_slot
 from bot.database import async_session
-from bot.events import mark_archived, mark_locked
+from bot.events import mark_locked, mark_published
 from bot.models import (
     Assignment,
     AuditLog,
@@ -46,8 +42,6 @@ from bot.optimizer.solver import SlotForOptimizer, run_full_optimization
 logger = logging.getLogger("scheduler.scheduling")
 
 
-# ─── Boundary-slot notice ────────────────────────────────────────
-
 BOUNDARY_NOTICE = (
     "\n\n**Boundary slot.** The slot at 23:45-00:15 (your last Day 1 block) "
     "spans the Day 1 / Day 2 boundary. You'll be the only player in that "
@@ -60,14 +54,12 @@ class Scheduling(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ─── Public lifecycle methods (called from main.py) ──────────
+    # ─── Lock: run optimizer, notify admins only ─────────────
 
     async def lock_and_release(self, event: Event):
-        """Lock submissions, run optimizer, notify players.
+        """Run optimizer and post CSV to #schedule_log for admin review.
 
-        Receives an Event hint; re-fetches by event_id within its own session.
-        Idempotent — if the event is not in COLLECTING, returns without doing
-        anything.
+        Does NOT DM players. Idempotent if already LOCKED.
         """
         event_id = event.event_id
 
@@ -79,7 +71,6 @@ class Scheduling(commands.Cog):
             mark_locked(db_event)
             day1 = db_event.day1_date
 
-            # Complete submissions only
             result = await session.execute(
                 select(Submission).where(
                     Submission.event_id == event_id,
@@ -89,7 +80,6 @@ class Scheduling(commands.Cog):
             )
             submissions = list(result.scalars().all())
 
-            # All slots for this event, bucketed for the optimizer
             result = await session.execute(
                 select(Slot).where(Slot.event_id == event_id)
             )
@@ -116,18 +106,13 @@ class Scheduling(commands.Cog):
 
             results = run_full_optimization(sub_data, slots_by_pass)
 
-            # Clear any existing assignments for idempotency on re-lock
             await session.execute(
-                Assignment.__table__.delete().where(
-                    Assignment.event_id == event_id
-                )
+                Assignment.__table__.delete().where(Assignment.event_id == event_id)
             )
 
             assigned_users: set[int] = set()
             for pass_name, assignments in results.items():
                 if pass_name == "boundary":
-                    # The boundary player is already assigned to D1-CM-49;
-                    # we don't materialize a separate D2-BOUNDARY row.
                     continue
                 for a in assignments:
                     session.add(Assignment(
@@ -152,7 +137,58 @@ class Scheduling(commands.Cog):
 
             await session.commit()
 
-        # CSV for #schedule_log
+        # Post CSV to #schedule_log for admins; no player notifications yet
+        csv_file = await self._generate_csv(event_id)
+
+        for guild in self.bot.guilds:
+            log_channel = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
+            admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+            if log_channel and admin_role:
+                test_tag = " (test)" if event.is_test else ""
+                await log_channel.send(
+                    f"{admin_role.mention} — Schedule locked and optimized{test_tag}. "
+                    f"**Review before publishing.** "
+                    f"{len(assigned_users)} players assigned across "
+                    f"{sum(len(v) for v in results.values() if isinstance(v, list))} slots.\n"
+                    f"Use `/schedule publish` when ready to release to players, "
+                    f"or edit with `/schedule assign`, `/schedule remove-player`, "
+                    f"`/schedule swap-players`.",
+                    file=discord.File(csv_file, filename=f"schedule_draft_{day1.date()}.csv"),
+                )
+
+    # ─── Publish: send player DMs, make schedule public ──────
+
+    async def publish(self, event: Event):
+        """Transition LOCKED → PUBLISHED and DM all players their assignments."""
+        event_id = event.event_id
+
+        async with async_session() as session:
+            db_event = await session.get(Event, event_id)
+            if db_event is None or db_event.phase != EventPhase.LOCKED:
+                return
+
+            mark_published(db_event)
+            day1 = db_event.day1_date
+
+            result = await session.execute(
+                select(Submission).where(Submission.event_id == event_id)
+            )
+            submissions = list(result.scalars().all())
+
+            # Collect all assigned discord IDs
+            assn_result = await session.execute(
+                select(Assignment.discord_id).where(Assignment.event_id == event_id)
+            )
+            assigned_users = set(assn_result.scalars().all())
+
+            session.add(AuditLog(
+                event_id=event_id,
+                action="Schedule published",
+                actor="system",
+                details={"assigned_users": len(assigned_users)},
+            ))
+            await session.commit()
+
         csv_file = await self._generate_csv(event_id)
 
         for guild in self.bot.guilds:
@@ -162,15 +198,12 @@ class Scheduling(commands.Cog):
             player_role = discord.utils.get(guild.roles, name=PLAYER_ROLE)
 
             if log_channel and admin_role:
-                test_tag = " (test)" if db_event.is_test else ""
+                test_tag = " (test)" if event.is_test else ""
                 await log_channel.send(
-                    f"{admin_role.mention} — Schedule locked and optimized{test_tag}.\n"
-                    f"{len(assigned_users)} users assigned across "
-                    f"{sum(len(v) for v in results.values() if isinstance(v, list))} slots.",
+                    f"Schedule published{test_tag} — {len(assigned_users)} players notified.",
                     file=discord.File(csv_file, filename=f"schedule_{day1.date()}.csv"),
                 )
 
-            # Per-player DMs
             await self._notify_players(guild, event_id, submissions, assigned_users)
 
             if scheduling_channel and player_role:
@@ -181,42 +214,7 @@ class Scheduling(commands.Cog):
                     f"To request changes, @mention me in this channel with what you need."
                 )
 
-    async def archive(self, event: Event):
-        """Archive the event. Idempotent."""
-        event_id = event.event_id
-
-        async with async_session() as session:
-            db_event = await session.get(Event, event_id)
-            if db_event is None or db_event.phase == EventPhase.ARCHIVED:
-                return
-
-            mark_archived(db_event)
-            day1 = db_event.day1_date
-
-            session.add(AuditLog(
-                event_id=event_id,
-                action="Event archived",
-                actor="system",
-            ))
-
-            await session.commit()
-
-        csv_file = await self._generate_csv(event_id)
-        for guild in self.bot.guilds:
-            log_channel = discord.utils.get(guild.text_channels, name=SCHEDULE_LOG_CHANNEL)
-            if log_channel:
-                msg = await log_channel.send(
-                    f"**Final schedule archive** — Event {day1.date()}",
-                    file=discord.File(csv_file, filename=f"schedule_final_{day1.date()}.csv"),
-                )
-                try:
-                    await msg.pin()
-                except discord.Forbidden:
-                    pass
-
-        logger.info(f"Event archived for Day 1 = {day1.date()}")
-
-    # ─── Internal helpers ────────────────────────────────────────
+    # ─── Player DMs ──────────────────────────────────────────
 
     async def _notify_players(
         self,
@@ -225,7 +223,6 @@ class Scheduling(commands.Cog):
         submissions: list[Submission],
         assigned_users: set[int],
     ):
-        """DM each player their assignments (or waitlist status)."""
         async with async_session() as session:
             result = await session.execute(
                 select(Assignment, Slot)
@@ -270,13 +267,16 @@ class Scheduling(commands.Cog):
             except discord.Forbidden:
                 logger.warning(f"Could not DM user {submission.discord_id} — DMs may be disabled.")
 
+    # ─── CSV generation ──────────────────────────────────────
+
     async def _generate_csv(self, event_id: int) -> io.BytesIO:
-        """Build a CSV of the current schedule for one event."""
+        """Build a full CSV of the current schedule, including all submission data."""
         async with async_session() as session:
             event = await session.get(Event, event_id)
             if event is None:
                 return io.BytesIO(b"No event found")
 
+            # All assignments with slot + submission data
             result = await session.execute(
                 select(Assignment, Slot, Submission)
                 .join(Slot, Assignment.slot_id == Slot.slot_id)
@@ -288,16 +288,74 @@ class Scheduling(commands.Cog):
                 .where(Assignment.event_id == event_id)
                 .order_by(Slot.day, Slot.track.desc(), Slot.slot_index)
             )
-            rows = result.all()
+            assigned_rows = result.all()
+
+            # Waitlisted players (complete submissions with no assignment)
+            assigned_ids = {a.discord_id for a, _, _ in assigned_rows}
+            waitlist_result = await session.execute(
+                select(Submission).where(
+                    Submission.event_id == event_id,
+                    Submission.discord_id.notin_(assigned_ids),
+                )
+            )
+            waitlisted = list(waitlist_result.scalars().all())
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Day", "Minister Position", "Player", "Time"])
+        writer.writerow([
+            "Day", "Minister Position", "Slot ID", "Start Time (UTC)",
+            "Player Name", "Discord ID", "In-Game Player ID",
+            "Speedup Construction (days)", "Speedup Research (days)",
+            "Speedup Training (days)", "Speedup General (days)",
+            "TTG", "TG", "Dust",
+            "Priority Day1 (pts)", "Priority Day2 (pts)", "Priority Day4 (days)",
+            "Available Slots", "Status",
+        ])
 
-        for assignment, slot, submission in rows:
+        for assignment, slot, submission in assigned_rows:
             position = "Noble Advisor" if slot.track == "NA" else "Chief Minister"
-            time_str = slot.start_time.strftime("%H:%M UTC")
-            writer.writerow([slot.day, position, submission.discord_name, time_str])
+            start_str = slot.start_time.strftime("%Y-%m-%d %H:%M")
+            writer.writerow([
+                slot.day,
+                position,
+                slot.slot_id,
+                start_str,
+                submission.discord_name,
+                submission.discord_id,
+                submission.player_ingame_id or "",
+                f"{submission.speedup_construction or 0:.2f}",
+                f"{submission.speedup_research or 0:.2f}",
+                f"{submission.speedup_training or 0:.2f}",
+                f"{submission.speedup_general or 0:.2f}",
+                f"{submission.ttg or 0:.0f}",
+                f"{submission.tg or 0:.0f}",
+                f"{submission.dust or 0:.0f}",
+                f"{submission.priority_x or 0:.0f}",
+                f"{submission.priority_y or 0:.0f}",
+                f"{submission.priority_z or 0:.2f}",
+                len(submission.availability or []),
+                "assigned",
+            ])
+
+        for submission in waitlisted:
+            writer.writerow([
+                "", "", "", "",
+                submission.discord_name,
+                submission.discord_id,
+                submission.player_ingame_id or "",
+                f"{submission.speedup_construction or 0:.2f}",
+                f"{submission.speedup_research or 0:.2f}",
+                f"{submission.speedup_training or 0:.2f}",
+                f"{submission.speedup_general or 0:.2f}",
+                f"{submission.ttg or 0:.0f}",
+                f"{submission.tg or 0:.0f}",
+                f"{submission.dust or 0:.0f}",
+                f"{submission.priority_x or 0:.0f}",
+                f"{submission.priority_y or 0:.0f}",
+                f"{submission.priority_z or 0:.2f}",
+                len(submission.availability or []),
+                "waitlisted",
+            ])
 
         return io.BytesIO(output.getvalue().encode("utf-8"))
 

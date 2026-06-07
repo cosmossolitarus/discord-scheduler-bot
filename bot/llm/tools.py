@@ -1,22 +1,12 @@
 """
 Anthropic tool schemas for the action pattern.
 
-Two separate sets:
-  COLLECTING_TOOLS — pre-lock actions (event.phase == COLLECTING)
-  LOCKED_TOOLS     — post-lock actions (event.phase == LOCKED)
+Three tool sets:
+  COLLECTING_TOOLS — pre-lock (COLLECTING phase)
+  REVIEWING_TOOLS  — player-facing during LOCKED (schedule being finalized); minimal
+  PUBLISHED_TOOLS  — post-publish (PUBLISHED phase); full change-request set
 
-The agent picks the right set based on the event's phase. Action names map
-1:1 to handler functions in bot/llm/handlers_*.py.
-
-Notes on schema design:
-  - Times are always HH:MM UTC (24-hour). The day field (1, 2, or 4) tells
-    us which calendar day to anchor to.
-  - For windows that cross midnight, end_utc can be earlier than start_utc
-    and slots.py treats it as "end is next day".
-  - swap requires other_player_discord_id (an integer). The agent will
-    have pre-validated that this id appeared in message.mentions AND has
-    an assignment in this event; the LLM picks it from the
-    VALID SWAP PARTNERS list in the state block.
+tools_for_phase() maps EventPhase values to the right set.
 """
 
 
@@ -27,9 +17,7 @@ _QUERY = {
     "name": "query",
     "description": (
         "Use when the user is asking about their own current state — their "
-        "assignments, availability, Speedups, or how the bot works. The "
-        "actual response goes in the text portion of your reply; this tool "
-        "is just a signal that you're answering a query, not making changes."
+        "assignments, availability, Speedups, resources, or how the bot works."
     ),
     "input_schema": {
         "type": "object",
@@ -47,9 +35,7 @@ _OUT_OF_SCOPE = {
     "name": "out_of_scope",
     "description": (
         "Use when the user is asking about something the bot doesn't handle: "
-        "Day 3 or Day 5 scheduling, jokes, other players' data, requests to "
-        "set Speedups via text (those must come from a screenshot), or any "
-        "non-scheduling chatter."
+        "Day 3 or Day 5 scheduling, other players' data, or truly unrelated chatter."
     ),
     "input_schema": {
         "type": "object",
@@ -66,9 +52,7 @@ _OUT_OF_SCOPE = {
 _CLARIFY = {
     "name": "clarify",
     "description": (
-        "Use when the user's request is ambiguous and you cannot reliably "
-        "act on it. The clarifying question goes in the text portion of "
-        "your reply; this tool is just a signal."
+        "Use when the user's request is ambiguous and you cannot reliably act on it."
     ),
     "input_schema": {
         "type": "object",
@@ -86,8 +70,7 @@ _GREET = {
     "name": "greet",
     "description": (
         "Use when the user sent a greeting ('hi', 'hello', 'test'), asked "
-        "for help, or sent an opener without a specific scheduling request. "
-        "The backend will respond with a standardized help message."
+        "for help, or sent an opener without a specific scheduling request."
     ),
     "input_schema": {
         "type": "object",
@@ -95,7 +78,6 @@ _GREET = {
             "kind": {
                 "type": "string",
                 "enum": ["greeting", "help_request", "unclear_opener"],
-                "description": "'greeting' for hi/hello/test, 'help_request' for explicit asks for help, 'unclear_opener' for chatter that isn't a real action.",
             },
         },
         "required": ["kind"],
@@ -106,8 +88,7 @@ _WINDOWS_ARRAY = {
     "type": "array",
     "description": (
         "List of time windows the user is available during, in UTC. "
-        "Empty list means 'not available that day'. Multiple windows "
-        "allowed (e.g. mornings and evenings)."
+        "Empty list means 'not available that day'."
     ),
     "items": {
         "type": "object",
@@ -126,16 +107,15 @@ _WINDOWS_ARRAY = {
 }
 
 
-# ─── Pre-lock toolset ────────────────────────────────────────────
+# ─── Pre-lock toolset (COLLECTING) ───────────────────────────────
 
 
 SET_AVAILABILITY = {
     "name": "set_availability",
     "description": (
         "Use when the user is providing or updating their available times "
-        "for ONE day. Only call this for Day 1, 2, or 4. Repeat the call "
-        "for multiple days. Empty `windows` means 'not available that day' "
-        "and removes any existing availability for that day."
+        "for ONE day. Only call for Day 1, 2, or 4. Repeat for multiple days. "
+        "Empty `windows` means 'not available that day'."
     ),
     "input_schema": {
         "type": "object",
@@ -151,20 +131,65 @@ SET_AVAILABILITY = {
     },
 }
 
-COLLECTING_TOOLS = [SET_AVAILABILITY, _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY]
+SET_PLAYER_ID = {
+    "name": "set_player_id",
+    "description": (
+        "Use when the user provides their in-game player ID — a numeric ID "
+        "usually 8–10 digits long (e.g. 'my ID is 12345678', 'player ID: 987654321'). "
+        "Do NOT call this for Discord IDs or other non-game IDs."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "player_id": {
+                "type": "string",
+                "description": "The raw in-game player ID string as provided (digits only).",
+            },
+        },
+        "required": ["player_id"],
+    },
+}
+
+SET_RESOURCES = {
+    "name": "set_resources",
+    "description": (
+        "Use when the user reports their premium resource counts: "
+        "Tempered Truegold (TTG / refined TG / refined truegold), "
+        "Truegold (TG), and/or Truegold Dust (dust / TG dust). "
+        "Only set the fields the user actually mentioned; omit the rest. "
+        "These affect Day 1 (TTG, TG) and Day 2 (Dust) scheduling priority."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ttg": {
+                "type": "number",
+                "description": "Tempered Truegold count (TTG / refined truegold).",
+            },
+            "tg": {
+                "type": "number",
+                "description": "Truegold count (TG).",
+            },
+            "dust": {
+                "type": "number",
+                "description": "Truegold Dust count (dust / TG dust).",
+            },
+        },
+    },
+}
+
+COLLECTING_TOOLS = [SET_AVAILABILITY, SET_PLAYER_ID, SET_RESOURCES, _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY]
 
 
-# ─── Post-lock toolset ───────────────────────────────────────────
+# ─── Post-publish toolset (PUBLISHED) ────────────────────────────
 
 
 MOVE_SLOT = {
     "name": "move_slot",
     "description": (
         "Use when the user wants to change the START TIME of one of their "
-        "current assignments. You must supply an absolute UTC start time "
-        "(HH:MM); if the user gave a relative offset like '3 hours earlier', "
-        "compute the new time yourself from their current assignment. The "
-        "move requires admin approval before it takes effect."
+        "current assignments. Supply an absolute UTC start time (HH:MM). "
+        "Requires admin approval."
     ),
     "input_schema": {
         "type": "object",
@@ -172,7 +197,6 @@ MOVE_SLOT = {
             "day": {
                 "type": "integer",
                 "enum": [1, 2, 4],
-                "description": "Which of the user's current assignments to move.",
             },
             "new_start_utc": {
                 "type": "string",
@@ -180,7 +204,7 @@ MOVE_SLOT = {
             },
             "reason": {
                 "type": "string",
-                "description": "Optional short reason from the user (e.g. 'work conflict').",
+                "description": "Optional short reason from the user.",
             },
         },
         "required": ["day", "new_start_utc"],
@@ -190,9 +214,8 @@ MOVE_SLOT = {
 DROP_SLOT = {
     "name": "drop_slot",
     "description": (
-        "Use when the user wants to give up one of their current "
-        "assignments entirely. Requires admin approval before it takes "
-        "effect."
+        "Use when the user wants to give up one of their current assignments. "
+        "Requires admin approval."
     ),
     "input_schema": {
         "type": "object",
@@ -200,12 +223,8 @@ DROP_SLOT = {
             "day": {
                 "type": "integer",
                 "enum": [1, 2, 4],
-                "description": "Which of the user's current assignments to drop.",
             },
-            "reason": {
-                "type": "string",
-                "description": "Optional short reason from the user.",
-            },
+            "reason": {"type": "string"},
         },
         "required": ["day"],
     },
@@ -214,18 +233,14 @@ DROP_SLOT = {
 WIDEN_AVAILABILITY = {
     "name": "widen_availability",
     "description": (
-        "Use when the user is offering ADDITIONAL availability (on top of "
-        "what they already gave). This does not change current assignments "
-        "by itself — it just lets the admin reassign them more easily if "
-        "needed. Applied immediately, no admin approval required."
+        "Use when the user is offering ADDITIONAL availability on top of what "
+        "they already gave. Does not change current assignments — just widens "
+        "the pool for admin reassignment. Applied immediately, no admin approval."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "day": {
-                "type": "integer",
-                "enum": [1, 2, 4],
-            },
+            "day": {"type": "integer", "enum": [1, 2, 4]},
             "windows": _WINDOWS_ARRAY,
         },
         "required": ["day", "windows"],
@@ -236,12 +251,9 @@ SWAP = {
     "name": "swap",
     "description": (
         "Use when the user wants to trade one of their slots for another "
-        "player's slot on the same day. Requires: the user @mentioned the "
-        "target (only choose an id from VALID SWAP PARTNERS in the state), "
-        "both users have an assignment for that day. The other player "
-        "must confirm and admin must approve before it applies. If no valid "
-        "partner is listed, do NOT call this tool — use `clarify` to ask "
-        "the user to @mention the target."
+        "player's slot on the same day. The user must @mention the target; "
+        "only choose an id from VALID SWAP PARTNERS in the state. "
+        "Requires both players to confirm and admin to approve."
     ),
     "input_schema": {
         "type": "object",
@@ -250,15 +262,8 @@ SWAP = {
                 "type": "integer",
                 "description": "Discord ID from VALID SWAP PARTNERS in the state.",
             },
-            "day": {
-                "type": "integer",
-                "enum": [1, 2, 4],
-                "description": "The day on which to swap.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional short reason from the user.",
-            },
+            "day": {"type": "integer", "enum": [1, 2, 4]},
+            "reason": {"type": "string"},
         },
         "required": ["other_player_discord_id", "day"],
     },
@@ -267,55 +272,38 @@ SWAP = {
 REQUEST_NEW_SLOT = {
     "name": "request_new_slot",
     "description": (
-        "Use POST-LOCK when the user wants to be ADDED to a slot on a day they "
-        "do NOT currently have an assignment for. Examples: 'can I get a Day 1 "
-        "spot after reset', 'add me to Day 2 around 6pm', 'sign me up for Day 4 "
-        "Noble Advisor near 8pm'. Check the state's assignments — only call this "
-        "if they have no assignment for that day (or for Day 4, no assignment in "
-        "the track being requested). If they ALREADY have an assignment on that "
-        "day and want a different time, use move_slot instead. Requires admin "
-        "approval; if the target slot is taken, admin can choose to bump the "
-        "current assignee."
+        "Use POST-PUBLISH when the user wants to be ADDED to a slot on a day "
+        "they do NOT currently have an assignment for. If they already have an "
+        "assignment on that day and want a different time, use move_slot instead. "
+        "Requires admin approval."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "day": {
-                "type": "integer",
-                "enum": [1, 2, 4],
-                "description": "Game day to be added to.",
-            },
+            "day": {"type": "integer", "enum": [1, 2, 4]},
             "new_start_utc": {
                 "type": "string",
-                "description": (
-                    "Desired slot start time in HH:MM UTC. Pick a specific "
-                    "30-minute boundary (X:15 or X:45). If the user gave a "
-                    "range, pick the earliest valid time in that range."
-                ),
+                "description": "Desired slot start in HH:MM UTC. Use a :15 or :45 boundary.",
             },
             "track": {
                 "type": "string",
                 "enum": ["NA", "CM"],
-                "description": (
-                    "Required for Day 4 (which has both Noble Advisor 'NA' and "
-                    "Chief Minister 'CM' tracks). If the user mentions 'Noble "
-                    "Advisor' or 'NA', use NA; otherwise use CM. For Day 1 and "
-                    "Day 2 there is only one track (CM) — omit this field."
-                ),
+                "description": "Required for Day 4. NA = Noble Advisor, CM = Chief Minister.",
             },
-            "reason": {
-                "type": "string",
-                "description": "Optional short reason from the user.",
-            },
+            "reason": {"type": "string"},
         },
         "required": ["day", "new_start_utc"],
     },
 }
 
-LOCKED_TOOLS = [
+PUBLISHED_TOOLS = [
     MOVE_SLOT, DROP_SLOT, REQUEST_NEW_SLOT, WIDEN_AVAILABILITY, SWAP,
     _QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY,
 ]
+
+# Minimal tools while schedule is in LOCKED (admin review) — players can query
+# their submission but can't request changes yet.
+LOCKED_REVIEW_TOOLS = [_QUERY, _GREET, _OUT_OF_SCOPE, _CLARIFY]
 
 
 # ─── Dispatch helper ─────────────────────────────────────────────
@@ -326,7 +314,7 @@ def tools_for_phase(phase_value: str) -> list[dict]:
     if phase_value == "collecting":
         return COLLECTING_TOOLS
     if phase_value == "locked":
-        return LOCKED_TOOLS
-    # ARCHIVED or unknown — return an empty list; the agent should refuse
-    # to act on archived events at a higher level.
+        return LOCKED_REVIEW_TOOLS
+    if phase_value == "published":
+        return PUBLISHED_TOOLS
     return []

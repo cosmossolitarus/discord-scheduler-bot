@@ -3,24 +3,15 @@ Agent: single entry point for handling an @mention to the bot.
 
 Architecture:
   1. PARSE — one LLM call with tool_choice="any" forces tool_use blocks.
-     The model's text output is ignored.
-  2. DISPATCH — each tool_use runs through a handler in handlers_*.
+  2. DISPATCH — each tool_use runs through a handler.
   3. RENDER — code templates the user-facing reply.
 
-Response shape:
-  - For state-changing actions in COLLECTING (set_availability, screenshot
-    parsed) and for explicit `query`, a SINGLE merged state summary is
-    shown — availability across all three days + Speedups. The per-action
-    lines from earlier versions are dropped in favor of this summary so
-    multi-day messages produce one coherent confirmation, not a list.
-  - Post-lock change requests (move/drop/swap) and `widen_availability`
-    each produce a short per-action confirmation line.
-  - `greet`/`out_of_scope`/`clarify` produce short stand-alone replies.
+Phase routing:
+  COLLECTING — full submission tools (availability, player ID, resources, screenshot)
+  LOCKED     — minimal tools only (query/greet); schedule is in admin review
+  PUBLISHED  — full change-request tools (move/drop/swap/etc.)
 
-Allowed emoji set: ✅ ❌ 🚨 only. No other emoji in templates.
-
-The state envelope is built BEFORE handlers run. To reflect post-handler
-state in the summary and completeness check, we re-fetch from the DB.
+Allowed emoji: ✅ ❌ 🚨 only.
 """
 
 from __future__ import annotations
@@ -33,8 +24,11 @@ from sqlalchemy import select
 
 from bot.config import ANTHROPIC_MODEL, GENERIC_SPLIT
 from bot.database import async_session
-from bot.llm.handlers_collecting import COLLECTING_HANDLERS
-from bot.llm.handlers_locked import LOCKED_HANDLERS
+from bot.llm.handlers_collecting import (
+    COLLECTING_HANDLERS,
+    LOCKED_REVIEW_HANDLERS,
+)
+from bot.llm.handlers_locked import PUBLISHED_HANDLERS
 from bot.llm.screenshot import parse_screenshot
 from bot.llm.slots import summarize_availability
 from bot.llm.state import build_state_envelope, render_state_for_prompt
@@ -52,104 +46,120 @@ logger = logging.getLogger("scheduler.llm.agent")
 _client = anthropic.AsyncAnthropic()
 
 
-# ─── Parsing prompt (LLM is a parser only) ──────────────────────
+# ─── Parsing prompt ──────────────────────────────────────────────
 
 
 _PARSE_PROMPT = """You are an intent parser for a scheduling bot. Read the \
 user's message and emit one or more tool_use blocks representing their intent. \
-Do NOT write any text response — only emit tool_use blocks. The text portion of \
-your output is ignored.
+Do NOT write any text response — only emit tool_use blocks.
 
 The bot manages 30-minute slots on Day 1, Day 2, and Day 4 of a 28-day cycle. \
 Day 3 and Day 5 are not tracked.
 
 ## TOOL SELECTION
 
-- `set_availability` (pre-lock): user is telling you their available times for a specific day. \
-Empty `windows` means "not available that day".
-- `widen_availability` (post-lock): user wants to ADD more available times on top of what they already have.
-- `move_slot` (post-lock): user wants to change the start time of an existing assignment. Compute \
-the absolute UTC time yourself for relative requests like "3 hours earlier".
-- `drop_slot` (post-lock): user wants to give up an assignment.
-- `request_new_slot` (post-lock): user does NOT have an assignment on the day they're asking about \
-and wants to be added to one (e.g. "can I get a Day 1 spot near reset", "sign me up for a Day 2 \
-slot at 7pm UTC", "add me to Day 4 Noble Advisor"). Check CURRENT STATE — only call this if the \
-user has no assignment for that day (or for Day 4, no assignment in the requested track). If \
-they already have an assignment on that day and want a different time, use `move_slot` instead.
-- `swap` (post-lock): user wants to trade slots with another player. Only call this if the user \
-@mentioned a player who appears in VALID SWAP PARTNERS in the state.
-- `query`: user is asking about their current state (their times, Speedups, status, deadlines).
-- `greet`: user said hi/hello/test, asked for help, or sent an opener without a specific action.
-- `out_of_scope`: user is asking about Day 3 or Day 5, other players' data, trying to set \
-Speedups via TEXT (e.g., "I have 5 days of construction speedups"), or sending truly unrelated \
-chatter. Do NOT use this as a fallback for scheduling intents you don't have an exact tool for — \
-those have parses (see below).
-- `clarify`: user's request is ambiguous and you cannot reliably act on it.
+### Submission tools (COLLECTING phase only)
+- `set_availability`: user is telling you their available times for a specific day. \
+  Empty `windows` means "not available that day".
+- `set_player_id`: user is providing their in-game numeric player ID \
+  (e.g. "my ID is 12345678"). 6–12 digits only. Do NOT use for Discord IDs.
+- `set_resources`: user is reporting how many TTG (Tempered Truegold / refined TG), \
+  TG (Truegold), or Dust (Truegold Dust / TG dust) they have. Only set the fields \
+  they mentioned. These are integer counts, not time values.
+
+### Change-request tools (PUBLISHED phase only)
+- `widen_availability`: user wants to ADD more available times on top of existing.
+- `move_slot`: user wants to change the start time of an existing assignment. \
+  Compute absolute UTC time yourself for relative requests.
+- `drop_slot`: user wants to give up an assignment.
+- `request_new_slot`: user has NO assignment on the requested day/track and wants one. \
+  Check CURRENT STATE — use `move_slot` instead if they already have one.
+- `swap`: user wants to trade slots with another player. Only call this if the user \
+  @mentioned a player who appears in VALID SWAP PARTNERS.
+
+### Always available
+- `query`: user is asking about their current state.
+- `greet`: user said hi/hello/test, asked for help, or sent an opener.
+- `out_of_scope`: Day 3/5 chatter, other players' data, or truly unrelated requests.
+- `clarify`: request is ambiguous and cannot be reliably acted on.
 
 ## MULTI-DAY MESSAGES
 
 Emit one tool_use per day. Example: "Day 1 anytime, Day 2 after 8pm UTC" → \
 set_availability(day=1, windows=[full day]) + set_availability(day=2, windows=[20:00-23:59]).
 
-Do NOT emit set_availability for days the user did NOT mention — partial updates preserve other days.
+Do NOT emit set_availability for days the user did NOT mention.
 
-## UPDATING A DAY ALREADY ON FILE
+## UPDATING AVAILABILITY
 
 set_availability REPLACES the windows for the day specified. Look at CURRENT \
 STATE's availability summary to decide how to compose `windows`:
+- ADDITIVE language ("also Day 1 evenings", "add Day 1 mornings") → include BOTH \
+  the existing windows AND the new ones.
+- REPLACEMENT language ("change Day 1 to evenings", "actually Day 1 mornings instead") \
+  → emit ONLY the new windows.
+- AMBIGUOUS → treat as REPLACEMENT. Latest message wins.
 
-- ADDITIVE language ("also Day 1 evenings", "Day 1 afternoons too", "add Day 1 \
-  mornings") → include BOTH the existing windows for that day AND the new ones \
-  in your windows list. The handler will replace the day with what you emit, so \
-  you must repeat the existing windows to preserve them.
-- REPLACEMENT language ("Day 1 only mornings", "change Day 1 to evenings", \
-  "actually Day 1 evenings instead", "scratch that, Day 1 mornings") → emit ONLY \
-  the new windows.
-- AMBIGUOUS ("Day 1 evenings" with prior Day 1 mornings on file) → treat as \
-  REPLACEMENT. Latest message wins.
+## CLEARING A DAY (pre-lock)
 
-## CLEARING A DAY
+"drop / remove / cancel / clear / scratch / take me off / I can't make / not available / skip" \
+for a day → set_availability(day=X, windows=[]).
 
-These verbs ALWAYS mean "make me unavailable that day" pre-lock, and parse to \
-set_availability(day=X, windows=[]):
-  drop / remove / cancel / clear / scratch / "take me off" / "I can't make" / \
-  "not available" / "skip"
+Pre-lock the word "drop" NEVER refers to `drop_slot`.
 
-Pre-lock the word "drop" NEVER refers to the post-lock `drop_slot` tool — that \
-tool does not exist pre-lock. "Drop my Day 1 time" = set_availability(day=1, windows=[]).
+## SIGNING UP WITHOUT A TIME
 
-## SIGNING UP WITHOUT A SPECIFIC TIME
-
-"Sign me up Day X" / "add me Day X" / "include me Day X" / "I'm in for Day X" / \
-"yes for Day X" with NO time mentioned → windows=[{start_utc:"00:00", end_utc:"23:59"}] \
-(treat as full day — it's a friendly default).
+"Sign me up Day X" / "add me Day X" / "I'm in for Day X" with NO time → \
+windows=[{start_utc:"00:00", end_utc:"23:59"}] (treat as full day).
 
 ## TIME RULES
 
 - All times in tool_use inputs are UTC, HH:MM 24-hour format.
-- Convert local timezones the user mentions to UTC.
+- Convert local timezones to UTC.
 - A window may cross midnight — emit end_utc earlier than start_utc, the backend handles it.
 - "Any day" / "anytime" / "all day" for Day X → windows=[{start_utc:"00:00", end_utc:"23:59"}].
 
-## RESET SEMANTICS (strict)
+## MIDNIGHT AMBIGUITY — IMPORTANT
+
+Day 1 and Day 4 each span nearly 25 hours. Their slot windows START at 23:45 of the \
+previous calendar night and END at 00:15 of the following morning. This means "0 UTC" \
+or "midnight" appears TWICE in each day's schedule:
+
+  Day 1 example (Day 1 = Mon May 18):
+    • Near the START: 00:00 on Mon May 18 falls inside the first Day 1 slot \
+(Sun May 17 23:45 → Mon May 18 00:15).
+    • Near the END: 00:00 on Tue May 19 falls inside the LAST Day 1 slot \
+(Mon May 18 23:45 → Tue May 19 00:15) — this is the boundary slot.
+
+  Day 4 has the same pattern (23:45 three nights before Day 1 through 00:15 four nights after).
+
+When a user says "midnight" or "0 UTC" or "reset" in the context of Day 1 or Day 4:
+  - If they mean the START of the day (just after the game resets for Day 1/4) → \
+    interpret as 00:00 of the Day 1/4 calendar date.
+  - If they mean the END of the day / "near Day 2 start" for Day 1 → \
+    interpret as 23:45-00:15 of the LAST slot (the boundary slot area).
+  - If it is AMBIGUOUS, emit `clarify` asking which end they mean: \
+    "Do you mean near the very start of Day 1 (around 00:00 on [Day 1 date]) or \
+    near the very end (around 23:45–00:15 crossing into [Day 2 date])?"
+
+For post-lock slot times: slots start at :15 or :45 past the hour. Never emit 00:00 \
+as a new_start_utc — use 23:45 or 00:15 depending on context.
+
+## RESET SEMANTICS
 
 - "close to reset" / "near reset" / "late" → 21:15-00:15 UTC
 - "after reset" / "just after reset" / "early" → 23:45 (previous day) - 02:45 UTC
-- "reset" alone → 00:00 UTC exactly
+- "reset" alone → 00:00 UTC exactly (which falls inside the :45→:15 slot centered on midnight)
 
 ## DAY MAPPING
 
-Players often refer to days by resource word:
 - construction / building = Day 1
 - research = Day 2
 - troops / training / soldiers = Day 4
 
-"build any day" means "Day 1 with full availability" (NOT "construction on every day"). \
-Each resource word maps to exactly one day number.
-
 ## SCREENSHOTS
 
-Screenshots are parsed separately by code; do not emit a tool for them. Just process the text.
+Screenshots are parsed separately by code — do not emit a tool for them.
 
 ## OUTPUT
 
@@ -170,7 +180,7 @@ def _strip_bot_mention(content: str, bot_id: int) -> str:
     return content.strip()
 
 
-# ─── Screenshot parsing (saves to DB) ───────────────────────────
+# ─── Screenshot parsing ─────────────────────────────────────────
 
 
 async def _parse_and_save_screenshot(
@@ -178,9 +188,6 @@ async def _parse_and_save_screenshot(
     event: "Event",
     message: "discord.Message",
 ) -> dict:
-    """Parse one screenshot and save resource values. Returns the parsed dict
-    on success or {"error": "..."} on failure.
-    """
     try:
         image_bytes = await attachment.read()
     except Exception as e:
@@ -211,6 +218,11 @@ async def _parse_and_save_screenshot(
             )
             session.add(submission)
 
+            # Check PlayerProfile for a known player ID
+            from bot.llm.handlers_collecting import _maybe_prefill_player_id
+            await session.flush()
+            await _maybe_prefill_player_id(session, submission)
+
         submission.speedup_construction = parsed["speedup_construction"]
         submission.speedup_research = parsed["speedup_research"]
         submission.speedup_training = parsed["speedup_training"]
@@ -227,16 +239,18 @@ async def _parse_and_save_screenshot(
 
 
 def _render_state_summary(state: dict, day1, include_assignments: bool = False) -> str:
-    """Multi-line block showing the user's current availability + Speedups.
-
-    Used both as the response to `query` and as the auto-summary appended
-    after any submission-touching action (set_availability, screenshot, or
-    widen_availability post-lock).
-    """
     sub = state["submission"]
     lines = ["**Current submission:**", ""]
 
-    # Availability section
+    # Player ID
+    if sub["has_player_id"] and sub["player_ingame_id"]:
+        lines.append(f"Player ID: {sub['player_ingame_id']}")
+    else:
+        lines.append("Player ID: not on file")
+
+    lines.append("")
+
+    # Availability
     lines.append("Availability:")
     if sub["availability_summary"]:
         for line in sub["availability_summary"].split("\n"):
@@ -246,20 +260,27 @@ def _render_state_summary(state: dict, day1, include_assignments: bool = False) 
 
     lines.append("")
 
-    # Speedups section
+    # Speedups
     if sub["speedups"]:
         r = sub["speedups"]
         lines.append(
             f"Speedups: construction {r['construction_days']:.2f}d, "
             f"research {r['research_days']:.2f}d, "
             f"troops {r['troops_days']:.2f}d, "
-            f"general {r['general_days']:.2f}d (split into {r['generic_split']})"
+            f"general {r['general_days']:.2f}d"
         )
     else:
         lines.append("Speedups: not on file")
 
-    # Assignments (post-lock only)
-    if include_assignments and state["phase"] == "locked":
+    # Premium resources (shown when any are set)
+    if sub["resources"]:
+        r = sub["resources"]
+        lines.append(
+            f"Resources: TTG {r['ttg']:.0f}, TG {r['tg']:.0f}, Dust {r['dust']:.0f}"
+        )
+
+    # Assignments (post-publish only)
+    if include_assignments and state["phase"] == "published":
         assignments = state.get("assignments") or []
         lines.append("")
         if assignments:
@@ -268,7 +289,7 @@ def _render_state_summary(state: dict, day1, include_assignments: bool = False) 
                 boundary = "  (boundary slot)" if a.get("is_boundary") else ""
                 lines.append(
                     f"  Day {a['day']} ({a['track_label']}): "
-                    f"{a['start_utc']}-{a['end_utc']} UTC{boundary}"
+                    f"{a['start_utc']}-{a['end_utc']} UTC on {a['date']}{boundary}"
                 )
         else:
             lines.append("Assignments: waitlisted (no current slots)")
@@ -276,7 +297,7 @@ def _render_state_summary(state: dict, day1, include_assignments: bool = False) 
     return "\n".join(lines)
 
 
-# ─── Render: short per-action lines ─────────────────────────────
+# ─── Render: per-action lines ───────────────────────────────────
 
 
 def _render_move_slot(inp: dict, state: dict) -> str:
@@ -333,15 +354,25 @@ def _render_swap(inp: dict, state: dict) -> str:
     )
 
 
-def _render_out_of_scope(inp: dict) -> str:
-    """Generic out-of-scope reply. Optionally appends the LLM's reason in italics.
+def _render_set_resources(inp: dict) -> str:
+    parts = []
+    if "ttg" in inp:
+        parts.append(f"TTG: {inp['ttg']:.0f}")
+    if "tg" in inp:
+        parts.append(f"TG: {inp['tg']:.0f}")
+    if "dust" in inp:
+        parts.append(f"Dust: {inp['dust']:.0f}")
+    if parts:
+        return f"Resources updated: {', '.join(parts)}."
+    return "Resources updated."
 
-    The previous template hardcoded "Speedups have to come from a screenshot,
-    not text", which read as a non-sequitur whenever the LLM reached for
-    out_of_scope for any other reason (Day 3 chatter, an unrecognized verb,
-    etc.). This version stays neutral and lets the LLM's `reason` field carry
-    context if it provided one.
-    """
+
+def _render_set_player_id(inp: dict) -> str:
+    pid = inp.get("player_id", "?")
+    return f"Player ID recorded: **{pid}**."
+
+
+def _render_out_of_scope(inp: dict) -> str:
     reason = (inp.get("reason") or "").strip()
     base = "I only handle availability and Speedups for **Day 1, Day 2, and Day 4**."
     if reason:
@@ -360,23 +391,29 @@ def _render_greet(state: dict) -> str:
     sub = state["submission"]
     avail_tag = "  (already on file)" if sub["has_availability"] else ""
     screen_tag = "  (already on file)" if sub["has_screenshot"] else ""
+    id_tag = "  (already on file)" if sub["has_player_id"] else ""
     lines = [
         "**Hi!** I'm the scheduling bot. I track 30-minute time slots on **Day 1, Day 2, and Day 4**.",
         "",
-        "**To be added to the schedule, I need both:**",
+        "**To be added to the schedule, I need:**",
         f"1. **Availability** — at least one time window on Day 1, 2, or 4{avail_tag}",
         f"2. **Speedups screenshot** — your in-game Speedups page{screen_tag}",
+        f"3. **Player ID** — your in-game numeric player ID{id_tag}",
+        "",
+        "**Optionally, to improve your priority:**",
+        "  Tell me your **TTG, TG, and Dust** counts (e.g. 'I have 3 TTG, 50 TG, 200 dust')",
         "",
         "**Examples:**",
         "  \"Day 1 from 2pm to 6pm EST\"",
         "  \"Day 2 anytime, Day 4 after 8pm UTC\"",
-        "  \"Not available Day 1\"",
+        "  \"My player ID is 12345678\"",
+        "  \"I have 5 TTG and 100 TG\"",
         "  \"What are my times?\"",
     ]
     return "\n".join(lines)
 
 
-# ─── Completeness status (pre-lock only) ────────────────────────
+# ─── Completeness (pre-lock only) ──────────────────────────────
 
 
 async def _completeness_status(
@@ -385,17 +422,6 @@ async def _completeness_status(
     was_complete_before: bool,
     screenshot_attempted: bool = False,
 ) -> str | None:
-    """Return a single status line:
-      - 🚨 reminder of what's missing, OR
-      - ✅ "just became complete" affirmation (only on transition), OR
-      - None when already complete / not applicable.
-
-    When `screenshot_attempted` is True, the user just tried to upload a
-    screenshot in this same message (which may have failed). In that case
-    we don't repeat "you still need a screenshot" — the parse-error line
-    already conveys that. We still warn about missing availability if it's
-    the only remaining gap.
-    """
     if event.phase != EventPhase.COLLECTING:
         return None
 
@@ -409,17 +435,14 @@ async def _completeness_status(
         sub = result.scalar_one_or_none()
 
     if sub is None:
-        if screenshot_attempted:
-            return (
-                "🚨 You also need to tell me your availability for Day 1, Day 2, "
-                "or Day 4 before I can add you to the schedule."
-            )
-        return (
-            "🚨 You still need to send a screenshot of your **Speedups** page AND "
-            "tell me your availability for Day 1, Day 2, or Day 4 before I can add you to the schedule."
-        )
+        missing = []
+        if not screenshot_attempted:
+            missing.append("a screenshot of your **Speedups** page")
+        missing.append("your availability for Day 1, Day 2, or Day 4")
+        missing.append("your **in-game player ID**")
+        return "🚨 You still need to send: " + "; ".join(missing) + " before I can add you to the schedule."
 
-    is_complete = sub.has_screenshot and sub.has_availability
+    is_complete = sub.has_screenshot and sub.has_availability and sub.has_player_id
     if is_complete:
         if not was_complete_before:
             return (
@@ -428,28 +451,19 @@ async def _completeness_status(
             )
         return None
 
-    if sub.has_availability and not sub.has_screenshot:
-        if screenshot_attempted:
-            return None  # error line already covers this
-        return (
-            "🚨 You still need to send a screenshot of your in-game "
-            "**Speedups** page — without it, I can't add you to the schedule."
-        )
-    if sub.has_screenshot and not sub.has_availability:
-        return (
-            "🚨 You still need to tell me your availability for Day 1, Day 2, or Day 4 — "
-            "without it, I can't add you to the schedule."
-        )
-    # Neither piece on file
-    if screenshot_attempted:
-        return (
-            "🚨 You also need to tell me your availability for Day 1, Day 2, "
-            "or Day 4 before I can add you to the schedule."
-        )
-    return (
-        "🚨 You still need to send a screenshot of your **Speedups** page AND "
-        "tell me your availability for Day 1, Day 2, or Day 4 before I can add you to the schedule."
-    )
+    missing = []
+    if not sub.has_screenshot:
+        if not screenshot_attempted:
+            missing.append("a screenshot of your **Speedups** page")
+    if not sub.has_availability:
+        missing.append("your availability for Day 1, Day 2, or Day 4")
+    if not sub.has_player_id:
+        missing.append("your **in-game player ID**")
+
+    if not missing:
+        return None
+
+    return "🚨 You still need: " + "; ".join(missing) + "."
 
 
 # ─── LLM parse call ─────────────────────────────────────────────
@@ -460,7 +474,6 @@ async def _parse_intent(
     state: dict,
     event: "Event",
 ) -> list[tuple[str, dict]] | None:
-    """Single LLM call. Returns [(action_name, action_input), ...] or None on failure."""
     tools = tools_for_phase(event.phase.value)
     if not tools:
         return []
@@ -490,8 +503,7 @@ async def _parse_intent(
 # ─── Public entry point ─────────────────────────────────────────
 
 
-# Action names that touch the submission (warrant a merged state summary).
-_SUBMISSION_TOUCHING = {"set_availability", "widen_availability", "query"}
+_SUBMISSION_TOUCHING = {"set_availability", "set_player_id", "set_resources", "widen_availability", "query"}
 
 
 async def process_user_message(
@@ -499,7 +511,6 @@ async def process_user_message(
     event: "Event",
     bot: "commands.Bot",
 ) -> str:
-    """Handle one @mention to the bot. Returns the reply text to send."""
     if bot.user is None:
         return "(bot not ready)"
 
@@ -510,16 +521,16 @@ async def process_user_message(
         or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
     ]
 
-    # 1. Build pre-handler state envelope so we know what was complete BEFORE
-    #    this message ran.
+    # Build pre-handler state
     async with async_session() as session:
         pre_state = await build_state_envelope(session, event, message)
     was_complete_before = (
         pre_state["submission"]["has_screenshot"]
         and pre_state["submission"]["has_availability"]
+        and pre_state["submission"]["has_player_id"]
     )
 
-    # 2. Parse + save screenshots silently. Track parse errors for per-attachment reporting.
+    # Parse + save screenshots silently
     screenshot_errors: list[str] = []
     screenshot_succeeded = False
     for att in image_attachments:
@@ -531,24 +542,27 @@ async def process_user_message(
 
     sections: list[str] = []
 
-    # 3. Surface any screenshot parse errors
     for err in screenshot_errors:
         sections.append(f"🚨 Couldn't read the screenshot: {err}")
 
-    # 4. Idle path — no text, no image: behave like a greeting
     if not text and not image_attachments:
         sections.append(_render_greet(pre_state))
 
-    # 5. Text path — parse and dispatch
     show_state_summary = screenshot_succeeded
+
     if text:
+        # During LOCKED, use the minimal review-phase handler set
+        if event.phase == EventPhase.LOCKED:
+            handlers = LOCKED_REVIEW_HANDLERS
+        elif event.phase == EventPhase.COLLECTING:
+            handlers = COLLECTING_HANDLERS
+        else:
+            handlers = PUBLISHED_HANDLERS
+
         actions = await _parse_intent(text, pre_state, event)
         if actions is None:
             sections.append("🚨 Sorry, I couldn't reach my language model. Please try again.")
         else:
-            handlers = (
-                COLLECTING_HANDLERS if event.phase == EventPhase.COLLECTING else LOCKED_HANDLERS
-            )
             action_lines: list[str] = []
             for action_name, action_input in actions:
                 handler = handlers.get(action_name)
@@ -565,10 +579,14 @@ async def process_user_message(
                     action_lines.append(f"🚨 {err}")
                     continue
 
-                # Success — decide what to render for this action
                 if action_name in _SUBMISSION_TOUCHING:
                     show_state_summary = True
-                    # No per-action line; the merged summary covers it.
+                elif action_name == "set_player_id":
+                    action_lines.append(_render_set_player_id(action_input))
+                    show_state_summary = True
+                elif action_name == "set_resources":
+                    action_lines.append(_render_set_resources(action_input))
+                    show_state_summary = True
                 elif action_name == "move_slot":
                     action_lines.append(_render_move_slot(action_input, pre_state))
                 elif action_name == "drop_slot":
@@ -578,34 +596,23 @@ async def process_user_message(
                 elif action_name == "swap":
                     action_lines.append(_render_swap(action_input, pre_state))
                 elif action_name in ("greet", "out_of_scope", "clarify"):
-                    # These three are "non-action" actions. If the user attached
-                    # an image, their text is almost certainly commentary on
-                    # the screenshot ("here are my speedups", "see attached")
-                    # and a help/refusal/clarification reply would be noise.
-                    # Suppress in that case; the screenshot result and state
-                    # summary already speak for themselves.
                     if not image_attachments:
                         if action_name == "greet":
                             action_lines.append(_render_greet(pre_state))
                         elif action_name == "out_of_scope":
                             action_lines.append(_render_out_of_scope(action_input))
-                        else:  # clarify
+                        else:
                             action_lines.append(_render_clarify(action_input))
-                # other no-op actions: nothing to render
 
             if action_lines:
                 sections.append("\n\n".join(action_lines))
 
-    # 6. Merged state summary (single block, post-handler)
     if show_state_summary:
         async with async_session() as session:
             post_state = await build_state_envelope(session, event, message)
-        include_assn = event.phase == EventPhase.LOCKED
+        include_assn = event.phase == EventPhase.PUBLISHED
         sections.append(_render_state_summary(post_state, event.day1_date, include_assn))
 
-    # 7. Completeness / just-became-complete (pre-lock only, single line).
-    #    `screenshot_attempted` suppresses the "send a screenshot" half of the
-    #    warning when one was just uploaded — the parse-error line covers it.
     screenshot_attempted = bool(image_attachments)
     status = await _completeness_status(
         event, message.author.id, was_complete_before, screenshot_attempted

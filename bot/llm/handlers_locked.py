@@ -613,7 +613,7 @@ async def handle_greet(
     return None
 
 
-LOCKED_HANDLERS = {
+PUBLISHED_HANDLERS = {
     "move_slot": handle_move_slot,
     "drop_slot": handle_drop_slot,
     "request_new_slot": handle_request_new_slot,
@@ -624,3 +624,6 @@ LOCKED_HANDLERS = {
     "out_of_scope": handle_out_of_scope,
     "clarify": handle_clarify,
 }
+
+# Backward-compat alias
+LOCKED_HANDLERS = PUBLISHED_HANDLERS

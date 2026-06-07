@@ -80,20 +80,6 @@ def compute_active_cycle_day1(now: datetime | None = None) -> datetime | None:
     return None
 
 
-def should_lock(event_day1: datetime, now: datetime | None = None) -> bool:
-    """True if an event in COLLECTING should transition to LOCKED."""
-    if now is None:
-        now = datetime.now(timezone.utc)
-    return now >= event_day1 + LOCK_OFFSET
-
-
-def should_archive(event_day1: datetime, now: datetime | None = None) -> bool:
-    """True if an event in LOCKED should transition to ARCHIVED."""
-    if now is None:
-        now = datetime.now(timezone.utc)
-    return now >= event_day1 + ARCHIVE_OFFSET
-
-
 def generate_slot_times(day1: datetime) -> list[dict]:
     """Generate slot definitions for an event.
 

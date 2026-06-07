@@ -1,9 +1,7 @@
 """
 Event lifecycle helpers — creating events and transitioning phases.
 
-This module contains the DB-touching counterparts to cycle.py's pure date
-math. Channel announcements, optimizer runs, and player notifications live
-in the cogs; this module only writes to the Event/Slot tables.
+All transitions are now admin-manual; no auto-transitions happen.
 """
 
 from datetime import datetime, timezone
@@ -19,18 +17,14 @@ async def create_event(
     day1: datetime,
     is_test: bool = False,
 ) -> Event:
-    """Create a new Event in COLLECTING phase, with all 195 slot rows attached.
-
-    Caller is responsible for committing the session and triggering any
-    side-effects (e.g. announcing in #scheduling).
-    """
+    """Create a new Event in COLLECTING phase, with all 195 slot rows attached."""
     event = Event(
         day1_date=day1,
         phase=EventPhase.COLLECTING,
         is_test=is_test,
     )
     session.add(event)
-    await session.flush()  # need event_id for slot foreign keys
+    await session.flush()
 
     for sd in generate_slot_times(day1):
         session.add(Slot(
@@ -47,24 +41,16 @@ async def create_event(
 
 
 def mark_locked(event: Event, now: datetime | None = None) -> None:
-    """In-memory transition: COLLECTING → LOCKED.
-
-    Caller commits the session and is responsible for running the optimizer
-    and posting the schedule.
-    """
+    """In-memory transition: COLLECTING → LOCKED."""
     if now is None:
         now = datetime.now(timezone.utc)
     event.phase = EventPhase.LOCKED
     event.locked_at = now
 
 
-def mark_archived(event: Event, now: datetime | None = None) -> None:
-    """In-memory transition: LOCKED → ARCHIVED.
-
-    Caller commits the session and is responsible for posting the final
-    CSV to #schedule_log.
-    """
+def mark_published(event: Event, now: datetime | None = None) -> None:
+    """In-memory transition: LOCKED → PUBLISHED."""
     if now is None:
         now = datetime.now(timezone.utc)
-    event.phase = EventPhase.ARCHIVED
-    event.archived_at = now
+    event.phase = EventPhase.PUBLISHED
+    event.published_at = now

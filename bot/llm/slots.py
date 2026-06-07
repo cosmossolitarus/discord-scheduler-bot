@@ -3,10 +3,6 @@ Slot derivation helpers.
 
 The LLM emits day numbers and HH:MM time windows; this module turns them
 into concrete slot IDs. Pure code, no LLM, no DB.
-
-This replaces the old llm/availability.py indirection (LLM rewrites text
-as an availability statement → parse that into slot IDs). Now the LLM
-directly emits structured time windows and we derive slot IDs in code.
 """
 
 from datetime import datetime, timedelta
@@ -15,12 +11,7 @@ from bot.cycle import generate_slot_times
 
 
 def _day_anchor(day1: datetime, day: int) -> datetime:
-    """The 00:00 UTC anchor for a given game day (Day 1, 2, or 4).
-
-    Day 1's slots span 23:45 of the previous calendar day through 00:15 of
-    the next; the anchor is the day1 date itself (which is also 00:00 UTC
-    on the Day 1 calendar). Day 2's anchor is day1 + 1d, etc.
-    """
+    """The 00:00 UTC anchor for a given game day."""
     offsets = {1: 0, 2: 1, 4: 3}
     if day not in offsets:
         raise ValueError(f"Unknown game day {day} (tracked: 1, 2, 4)")
@@ -28,7 +19,6 @@ def _day_anchor(day1: datetime, day: int) -> datetime:
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
-    """Parse 'HH:MM' (24-hour). Raises ValueError on bad input."""
     parts = value.strip().split(":")
     if len(parts) != 2:
         raise ValueError(f"Expected HH:MM, got {value!r}")
@@ -51,12 +41,8 @@ def slots_in_window(
 ) -> list[str]:
     """Slot IDs whose [start, end) overlaps a single window on `day`.
 
-    The window is interpreted on the day's calendar anchor (see _day_anchor).
-    If end <= start, the window is treated as crossing midnight forward.
-
-    A slot is included whenever its time range overlaps the window at all —
-    even partially — matching the "be generous" interpretation that the old
-    availability prompt used to enforce.
+    If end <= start the window crosses midnight forward. Slots are included
+    when their time range overlaps the window at all (generous matching).
     """
     slots = slots_for_day(day1, day)
     if not slots:
@@ -69,7 +55,7 @@ def slots_in_window(
     window_start = anchor.replace(hour=sh, minute=sm, second=0, microsecond=0)
     window_end = anchor.replace(hour=eh, minute=em, second=0, microsecond=0)
     if window_end == window_start:
-        return []  # zero-length window — treat as malformed
+        return []
     if window_end < window_start:
         window_end += timedelta(days=1)
 
@@ -87,18 +73,19 @@ def slots_in_windows(
 ) -> list[str]:
     """Union of slot IDs across multiple windows on the same day.
 
-    `windows` is a list of {start_utc: "HH:MM", end_utc: "HH:MM"} dicts.
-    Result is sorted by slot_index (ascending) and de-duplicated.
+    For Day 4, which has two parallel tracks (NA and CM) at every time window,
+    both D4-NA-* and D4-CM-* slots are returned. This ensures players are
+    eligible for optimizer assignment on both tracks; the optimizer's pass
+    ordering (NA first, then CM with NA-winners excluded) handles deduplication.
     """
     seen: set[str] = set()
     for w in windows:
         try:
             ids = slots_in_window(day1, day, w["start_utc"], w["end_utc"])
         except (KeyError, ValueError):
-            continue  # skip malformed windows; agent reports
+            continue
         seen.update(ids)
 
-    # Sort by slot_index so output is stable
     all_slots = slots_for_day(day1, day)
     return [s["slot_id"] for s in all_slots if s["slot_id"] in seen]
 
@@ -111,15 +98,13 @@ def find_slot_by_start(
 ) -> str | None:
     """The slot ID whose start_time matches HH:MM on `day`, or None.
 
-    Day 1 and Day 4 have 23:45 appearing twice in the slot list (once at the
-    very start, once near the end). When the input is ambiguous, prefer the
-    LATER occurrence — that matches the natural user reading of "23:45 on
-    Day 1" as the end-of-Day-1 boundary slot rather than the first slot of
-    the Day 1 range.
+    Day 1 and Day 4 have 23:45 appearing twice (once at the very start of
+    the day's slot window, once near the end). When the input is 23:45,
+    prefer the LATER occurrence — this matches the natural user intent of
+    "23:45 Day 1" meaning the end-of-Day-1 boundary slot rather than the
+    first slot of the range.
 
-    For Day 4 (which has both NA and CM tracks at every time), pass `track`
-    to disambiguate. Without it, returns one match arbitrarily (caller
-    should pass the user's current track).
+    For Day 4 (NA and CM tracks at every time), pass `track` to disambiguate.
     """
     try:
         sh, sm = _parse_hhmm(start_hhmm)
@@ -138,23 +123,38 @@ def find_slot_by_start(
 
 
 def format_slot_time(slot: dict) -> str:
-    """Render a slot's time as 'HH:MM-HH:MM UTC' for user-facing messages."""
+    """Render a slot's time as 'HH:MM-HH:MM UTC'."""
     return (
         f"{slot['start_time'].strftime('%H:%M')}-"
         f"{slot['end_time'].strftime('%H:%M')} UTC"
     )
 
 
+def _window_label(ws: datetime, we: datetime) -> str:
+    """Format a time window for display.
+
+    When the window crosses midnight (end date differs from start date),
+    include the weekday+date so players can tell which calendar night it falls
+    on. This is critical for Day 1 (slots start at 23:45 the night before) and
+    Day 4 (same pattern, starts at 23:45 three nights before).
+    """
+    start_str = ws.strftime("%H:%M")
+    end_str = we.strftime("%H:%M")
+
+    if ws.date() == we.date():
+        return f"{start_str}-{end_str} UTC"
+    # Crosses midnight — show abbreviated weekday+date for clarity
+    start_date = ws.strftime("%a %b %-d")
+    end_date = we.strftime("%a %b %-d")
+    return f"{start_date} {start_str} - {end_date} {end_str} UTC"
+
+
 def summarize_availability(day1: datetime, slot_ids: list[str]) -> str:
     """One-line-per-day summary of the user's availability.
 
-    Output looks like:
-        Day 1: 14:00-18:00 UTC
-        Day 2: 19:00-23:00 UTC, 02:00-04:00 UTC
-        Day 4: not available
-
-    Used in the state envelope so the LLM can echo back what we have on file
-    when responding to queries or partial updates.
+    Day 1 and Day 4 windows that cross midnight include calendar dates to
+    disambiguate (e.g. "Sun May 17 23:45 - Mon May 18 00:15 UTC" vs
+    "Mon May 18 00:15-00:45 UTC").
     """
     if not slot_ids:
         return "Day 1: not set\nDay 2: not set\nDay 4: not set"
@@ -170,9 +170,8 @@ def summarize_availability(day1: datetime, slot_ids: list[str]) -> str:
             lines.append(f"Day {day}: not available")
             continue
 
-        # Day 4 has two tracks (NA and CM) at every time. For user-facing
-        # display, dedupe by (start_time, end_time) so the same window
-        # doesn't appear twice — once from each track.
+        # Day 4 has two tracks (NA and CM) at every time; dedupe by time range
+        # for user-facing display.
         seen_ranges: set[tuple[datetime, datetime]] = set()
         unique: list[dict] = []
         for s in day_slots:
@@ -196,10 +195,7 @@ def summarize_availability(day1: datetime, slot_ids: list[str]) -> str:
                 cur_end = s["end_time"]
         windows.append((cur_start, cur_end))
 
-        parts = [
-            f"{ws.strftime('%H:%M')}-{we.strftime('%H:%M')} UTC"
-            for ws, we in windows
-        ]
+        parts = [_window_label(ws, we) for ws, we in windows]
         lines.append(f"Day {day}: {', '.join(parts)}")
 
     return "\n".join(lines)
