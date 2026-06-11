@@ -9,7 +9,7 @@ override without editing this file.
 """
 
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 
 
 # ─── Discord IDs ────────────────────────────────────────────────
@@ -36,11 +36,6 @@ SCHEDULE_APPROVE_CHANNEL = os.environ.get(
     "SCHEDULE_APPROVE_CHANNEL", "❗kvk-approve-schedules"
 )  # Admin action queue: ✅/❌ reactions on change requests
 
-# ─── Cycle Timing ───────────────────────────────────────────────
-# Anchor: Day 1 of a known event cycle, at 0:00 UTC.
-# Every subsequent cycle is exactly 28 days later.
-ANCHOR_DAY1 = datetime(2026, 5, 18, 0, 0, 0, tzinfo=timezone.utc)
-CYCLE_LENGTH_DAYS = 28
 
 # Submissions open 5 days before Day 1 (= 4 days before Day 0 lock day).
 SUBMISSIONS_OPEN_OFFSET = timedelta(days=-5)

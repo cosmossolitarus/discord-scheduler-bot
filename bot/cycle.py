@@ -10,11 +10,9 @@ Real cycles repeat every 28 days from the anchor. Test events have arbitrary
 day1 dates and do not auto-transition — they are driven by admin commands.
 """
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 
 from bot.config import (
-    ANCHOR_DAY1,
-    CYCLE_LENGTH_DAYS,
     SUBMISSIONS_OPEN_OFFSET,
     LOCK_OFFSET,
     ARCHIVE_OFFSET,
@@ -45,39 +43,6 @@ def get_cycle_dates(day1: datetime) -> dict[str, datetime]:
         "archive":    day1 + ARCHIVE_OFFSET,
     }
 
-
-def compute_active_cycle_day1(now: datetime | None = None) -> datetime | None:
-    """Return the Day 1 of the cycle whose submissions_open..archive window
-    contains `now`, or None if we are in the idle gap between cycles.
-
-    This is used ONLY when the database has no non-archived event and the
-    lifecycle loop needs to decide whether to create a new real event.
-
-    The function never advances past archive into a future cycle's day1 unless
-    that next cycle's submissions are actually open. That's the fix for the
-    old gotcha where get_current_cycle_day1 would silently jump ahead.
-    """
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    delta_days = (now - ANCHOR_DAY1).total_seconds() / 86400
-    cycle_num = int(delta_days // CYCLE_LENGTH_DAYS)
-
-    # Check the current cycle (if past the anchor) and the next one.
-    # No two cycle windows overlap so at most one of these can match.
-    candidates_to_check = []
-    if cycle_num >= 0:
-        candidates_to_check.append(cycle_num)
-    candidates_to_check.append(max(0, cycle_num + 1))
-
-    for cn in candidates_to_check:
-        day1 = ANCHOR_DAY1 + timedelta(days=cn * CYCLE_LENGTH_DAYS)
-        open_time = day1 + SUBMISSIONS_OPEN_OFFSET
-        archive_time = day1 + ARCHIVE_OFFSET
-        if open_time <= now < archive_time:
-            return day1
-
-    return None
 
 
 def generate_slot_times(day1: datetime) -> list[dict]:
